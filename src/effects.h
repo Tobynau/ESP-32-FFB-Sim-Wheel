@@ -7,16 +7,16 @@ float mix_effects(float angle, float vel);
 // Handle an incoming HID FFB report (report id + raw buffer)
 void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len);
 
-// Effect block types (partial mapping)
+// Effect block types (USB HID PID spec mapping)
 enum EffectType {
 	ET_NONE = 0,
-	ET_CONSTANT = 1,
-	ET_RAMP = 2,
-	ET_SPRING = 3,
-	ET_DAMPER = 4,
-	ET_FRICTION = 5,
-	ET_PERIODIC = 6,
-	ET_CONDITION = 7
+	ET_CONSTANT = 1,      // USB PID: 0x26 (Constant Force)
+	ET_RAMP = 2,          // USB PID: 0x27 (Ramp)
+	ET_SPRING = 3,        // USB PID: 0x40 (Spring)
+	ET_DAMPER = 4,        // USB PID: 0x41 (Damper)
+	ET_FRICTION = 5,      // USB PID: 0x42 (Inertia/Friction)
+	ET_PERIODIC = 6,      // USB PID: 0x30-0x34 (Sine, Square, Triangle, Saw)
+	ET_CONDITION = 7      // Generic condition-based effect
 };
 
 // Small effect block structure used by the firmware

@@ -16,4 +16,9 @@ void on_hid_set_report(uint8_t report_id, uint8_t *buf, uint16_t len);
 // Configurable pins
 extern int button_pin;
 
+// PID State globals - accessed from effects.cpp
+extern bool actuators_enabled;
+extern bool safety_switch;
+extern uint8_t effect_playing;
+
 #endif // HID_H

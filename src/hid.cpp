@@ -12,15 +12,16 @@ USBHID HID;
 // HID Report Descriptor
 // ----------------------
 static const uint8_t report_descriptor[] = {
-  // Application Collection: Steering Wheel + FFB
+  // Application Collection: Steering Wheel
   0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x04,        // Usage (Joystick)
+  0x09, 0x04,        // Usage (Joystick) 
   0xA1, 0x01,        // Collection (Application)
-
+  
     // -------- Input Report: Steering Axis + Button --------
     0x85, 0x01,              // Report ID 1 (INPUT)
-    
+
     // Steering Axis
+    0x05, 0x01,              // Usage Page (Generic Desktop)
     0x09, 0x30,              // Usage (X)
     0x16, 0x01, 0x80,        // Logical Minimum (-32767)
     0x26, 0xFF, 0x7F,        // Logical Maximum (32767)
@@ -43,76 +44,6 @@ static const uint8_t report_descriptor[] = {
     0x95, 0x01,
     0x81, 0x03,              // Input (Const)
 
-    // -------- Force Feedback (PID) Outputs --------
-    0x05, 0x0F,              // Usage Page (Physical Interface Device)
-
-    // Constant Force
-    0x09, 0x26,              // Usage (Constant Force)
-    0x85, 0x02,              // Report ID 2
-    0x75, 0x10,              // Report Size (16)
-    0x95, 0x01,
-    0x91, 0x02,              // Output
-
-    // Ramp Force
-    0x09, 0x27,
-    0x85, 0x03,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    // Spring
-    0x09, 0x40,
-    0x85, 0x04,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    // Damper
-    0x09, 0x41,
-    0x85, 0x05,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    // Friction
-    0x09, 0x42,
-    0x85, 0x06,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    // Periodic Effects: Sine, Square, Triangle, Saw
-    0x09, 0x30,
-    0x85, 0x07,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    0x09, 0x31,
-    0x85, 0x08,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    0x09, 0x32,
-    0x85, 0x09,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    0x09, 0x33,
-    0x85, 0x0A,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
-    // Conditional Effect
-    0x09, 0x50,
-    0x85, 0x0B,
-    0x75, 0x10,
-    0x95, 0x01,
-    0x91, 0x02,
-
   0xC0  // End Application Collection
 };
 
@@ -134,6 +65,11 @@ auto angle_to_hid16 = [](float angle_rad) -> int16_t {
 // ----------------------
 // HID Device Class
 // ----------------------
+// PID State - CRITICAL for Windows FFB detection
+bool actuators_enabled = true;  // Must be true for FFB to work
+bool safety_switch = true;      // Indicates no safety issues
+uint8_t effect_playing = 0;     // Currently playing effect index (0 = none)
+
 class CustomHIDDevice : public USBHIDDevice {
 public:
   CustomHIDDevice(void) {
@@ -154,6 +90,26 @@ public:
   bool _onSetReport(uint8_t reportId, uint8_t *buffer, uint16_t len) {
     on_hid_set_report(reportId, buffer, len);
     return true;
+  }
+
+  uint16_t _onGetFeature(uint8_t report_id, uint8_t *buffer, uint16_t len) {
+    // PID State Feature Report (Report ID 2)
+    if (report_id == 0x02) {
+      // Report format:
+      // Byte 0: Status bits (actuators_enabled, safety_switch, effect_playing)
+      // Byte 1: Effect Block Index (1-16, or 0 if none playing)
+      
+      uint8_t status = 0;
+      if (actuators_enabled) status |= 0x01;  // Bit 0: Actuators Enabled
+      if (safety_switch) status |= 0x02;       // Bit 1: Safety Switch
+      if (effect_playing > 0) status |= 0x04;  // Bit 2: Effect Playing
+      
+      buffer[0] = status;
+      buffer[1] = effect_playing;
+      
+      return 2;
+    }
+    return 0;
   }
 
   bool send(uint8_t *value, uint16_t len) {
