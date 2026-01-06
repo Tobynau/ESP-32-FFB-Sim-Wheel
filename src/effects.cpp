@@ -1,4 +1,5 @@
 #include "effects.h"
+#include "hid.h"
 #include <Arduino.h>
 #include <math.h>
 #define CTRL_HZ 1000UL
@@ -115,6 +116,12 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
 }
 
 float mix_effects(float angle, float vel) {
+    // Check if actuators are enabled
+    extern bool actuators_enabled;
+    if (!actuators_enabled) {
+        return 0.0f; // No force if actuators disabled
+    }
+    
     float tau = 0.0f;
     
     // Compute effect blocks (new system)
@@ -185,161 +192,291 @@ static float int16_to_unit(int16_t v) {
     return (float)v / 32767.0f;
 }
 
-// Parse incoming FFB report (simple mapping). Many HID FFB reports are more complex,
-// but here we support the basic magnitude/value style reports matching the descriptor.
+// Helper to read 16-bit value from buffer (little-endian)
+static int16_t read_int16(uint8_t *buf, int offset) {
+    return (int16_t)((uint16_t)buf[offset] | ((uint16_t)buf[offset+1] << 8));
+}
+
+// Helper to read 8-bit unsigned value
+static uint8_t read_uint8(uint8_t *buf, int offset) {
+    return buf[offset];
+}
+
+// Parse incoming FFB report according to the USB HID PID specification
 void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
     // Update last effect time so mix_effects doesn't timeout
     last_effect_time = millis();
-    // Many host FFB packets are structured. Here we handle several simple possibilities:
-    // - If report is exactly 2 bytes -> treat as magnitude for simple effect (report id maps to type)
-    // - If report is longer, try to parse a small DirectInput-style structure where bytes contain
-    //   effect block index and parameters. We'll implement a compact parser for common subcommands:
-    //   - 0x01: set effect block (index in buf[0]) with type in report_id, magnitude in next 2 bytes
-    //   - 0x02: start effect block (index)
-    //   - 0x03: stop effect block (index)
-    //   - 0x04: set envelope/params (index, param1..)
 
-    if (len >= 2) {
-        // Simple 16-bit magnitude (little-endian)
-    if (len == 2) {
-            int16_t mag = (int16_t)((uint16_t)buf[0] | (uint16_t)buf[1] << 8);
-            float val = int16_to_unit(mag);
-            // map report id to simple effect
-            if (ffb_verbose) Serial.printf("FFB: simple magnitude rpt=%d val=%.3f\n", report_id, val);
-            switch (report_id) {
-                case 2: {
-                    // constant -> try block 0, else find free
-                    EffectBlock *b = get_block(0);
-                    if (b && !b->in_use) {
-                        // use block 0
-                    } else if (!b || b->in_use) {
-                        // find free block
-                        int i = find_free_block();
-                        if (i >= 0) b = get_block(i);
-                        else b = NULL;
-                    }
-                    if (b) {
-                        b->in_use = 1; b->type = ET_CONSTANT; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->magnitude = val; b->gain = 1.0f;
-                    }
-                } break;
-                case 3: {
-                    // ramp -> try block 1, else find free
-                    EffectBlock *b = get_block(1);
-                    if (b && !b->in_use) {
-                        // use block 1
-                    } else if (!b || b->in_use) {
-                        int i = find_free_block();
-                        if (i >= 0) b = get_block(i);
-                        else b = NULL;
-                    }
-                    if (b) {
-                        b->in_use = 1; b->type = ET_RAMP; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 100; // default
-                        b->magnitude = val; b->magnitude_end = val; b->gain = 1.0f;
-                    }
-                } break;
-                case 4: {
-                    int i = find_free_block(); if (i >= 0) {
-                        EffectBlock *b = get_block(i);
-                        b->in_use = 1; b->type = ET_SPRING; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->magnitude = val; b->param1 = fabsf(val) * 20.0f; b->param2 = 0.0f; b->gain = 1.0f;
-                    }
-                } break;
-                case 5: {
-                    int i = find_free_block(); if (i >= 0) {
-                        EffectBlock *b = get_block(i);
-                        b->in_use = 1; b->type = ET_DAMPER; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->param1 = fabsf(val) * 10.0f; b->gain = 1.0f;
-                    }
-                } break;
-                case 6: {
-                    int i = find_free_block(); if (i >= 0) {
-                        EffectBlock *b = get_block(i);
-                        b->in_use = 1; b->type = ET_FRICTION; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->magnitude = val; b->gain = 1.0f;
-                    }
-                } break;
-        case 7: case 8: case 9: case 10: {
-                    int i = find_free_block(); if (i >= 0) {
-                        EffectBlock *b = get_block(i);
-                        b->in_use = 1; b->type = ET_PERIODIC; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->magnitude = val; b->param1 = (float)(report_id - 7); b->freq_hz = 2.0f; b->phase = 0.0f; b->gain = 1.0f;
-            if (ffb_verbose) Serial.printf("FFB: created periodic block idx=%d type=%d amp=%.3f\n", i, (int)b->param1, b->magnitude);
-                    }
-                } break;
-                case 11: {
-                    int i = find_free_block(); if (i >= 0) {
-                        EffectBlock *b = get_block(i);
-                        b->in_use = 1; b->type = ET_CONDITION; b->active = true;
-                        b->start_time_ms = millis(); b->duration_ms = 0;
-                        b->magnitude = val; b->param1 = 0.1f; b->gain = 1.0f;
-                    }
-                } break;
+    // Parse based on Report ID from the descriptor
+    switch (report_id) {
+        case 0x03: { // Set Effect Report
+            // Format: [effect_index, effect_type, duration_lo, duration_hi, trigger_button, 
+            //          sample_period_lo, sample_period_hi, gain]
+            if (len < 8) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);  // 1-16
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--; // Convert to 0-15 array index
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (!b) break;
+            
+            uint8_t effect_type = read_uint8(buf, 1); // 1=constant, 2=ramp, etc.
+            uint16_t duration = (uint16_t)read_int16(buf, 2);
+            uint8_t gain = read_uint8(buf, 7);
+            
+            // Initialize the effect block
+            b->in_use = 1;
+            b->type = effect_type; // Map directly: 1=constant, 3=spring, 4=damper, etc.
+            b->active = false; // Wait for Effect Operation command to start
+            b->duration_ms = duration; // 0 = infinite
+            b->gain = gain / 255.0f;
+            b->start_time_ms = 0;
+            
+            if (ffb_verbose) {
+                Serial.printf("FFB: Set Effect idx=%d type=%d dur=%d gain=%.2f\n", 
+                    effect_idx, effect_type, duration, b->gain);
             }
-            return;
-        }
-        // If len >= 3, attempt a small structured parse: first byte = cmd, second = index
-        uint8_t cmd = buf[0];
-        uint8_t idx = buf[1];
-        if (ffb_verbose) Serial.printf("FFB: structured cmd=0x%02X idx=%d len=%d\n", cmd, idx, len);
-        switch (cmd) {
-            case 0x01: { // set effect param (index, type==report_id)
-                EffectBlock *b = get_block(idx);
-                if (b) {
-                    b->in_use = 1; b->type = (report_id == 2) ? ET_CONSTANT : (report_id == 3) ? ET_RAMP : b->type;
-                    // read magnitude from buf[2..3]
-                    if (len >= 4) {
-                        int16_t mag = (int16_t)((uint16_t)buf[2] | (uint16_t)buf[3] << 8);
-                        b->magnitude = int16_to_unit(mag);
+        } break;
+
+        case 0x04: { // Set Envelope Report
+            // Format: [effect_index, attack_level, attack_time_lo, attack_time_hi,
+            //          fade_level, fade_time_lo, fade_time_hi]
+            if (len < 7) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            // For now, we'll store envelope in param fields (can be expanded later)
+            EffectBlock *b = get_block(effect_idx);
+            if (!b || !b->in_use) break;
+            
+            // Could implement envelope shaping here
+            // For simplicity, we'll just note it was set
+        } break;
+
+        case 0x05: { // Set Constant Force Report
+            // Format: [effect_index, magnitude_lo, magnitude_hi]
+            if (len < 3) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (!b || !b->in_use) break;
+            
+            int16_t magnitude = read_int16(buf, 1);
+            b->magnitude = int16_to_unit(magnitude);
+            b->type = ET_CONSTANT;
+            
+            if (ffb_verbose) {
+                Serial.printf("FFB: Set Constant idx=%d mag=%.3f\n", effect_idx, b->magnitude);
+            }
+        } break;
+
+        case 0x06: { // Set Condition Report (Spring, Damper, Friction, Inertia)
+            // Format: [effect_index, param_block_offset:4, type_specific_offset:4,
+            //          cp_offset_lo, cp_offset_hi, pos_coeff_lo, pos_coeff_hi,
+            //          neg_coeff_lo, neg_coeff_hi, pos_sat_lo, pos_sat_hi,
+            //          neg_sat_lo, neg_sat_hi, deadband_lo, deadband_hi]
+            if (len < 15) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (!b || !b->in_use) break;
+            
+            // Parse condition parameters
+            int16_t cp_offset = read_int16(buf, 2);
+            int16_t pos_coeff = read_int16(buf, 4);
+            int16_t neg_coeff = read_int16(buf, 6);
+            int16_t pos_sat = read_int16(buf, 8);
+            int16_t neg_sat = read_int16(buf, 10);
+            int16_t deadband = read_int16(buf, 12);
+            
+            // Store parameters based on effect type
+            if (b->type == ET_SPRING) {
+                b->param1 = int16_to_unit(pos_coeff) * 50.0f; // stiffness coefficient
+                b->param2 = int16_to_unit(cp_offset) * M_PI;  // center position in radians
+            } else if (b->type == ET_DAMPER) {
+                b->param1 = int16_to_unit(pos_coeff) * 20.0f; // damping coefficient
+            } else if (b->type == ET_FRICTION) {
+                b->magnitude = int16_to_unit(pos_coeff);
+            }
+            
+            if (ffb_verbose) {
+                Serial.printf("FFB: Set Condition idx=%d cp=%d pos=%d neg=%d\n",
+                    effect_idx, cp_offset, pos_coeff, neg_coeff);
+            }
+        } break;
+
+        case 0x07: { // Set Periodic Report
+            // Format: [effect_index, magnitude_lo, magnitude_hi, offset_lo, offset_hi,
+            //          phase, period_lo, period_hi]
+            if (len < 8) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (!b || !b->in_use) break;
+            
+            int16_t magnitude = read_int16(buf, 1);
+            int16_t offset = read_int16(buf, 3);
+            uint8_t phase = read_uint8(buf, 5);
+            uint16_t period = (uint16_t)read_int16(buf, 6);
+            
+            b->type = ET_PERIODIC;
+            b->magnitude = int16_to_unit(magnitude);
+            b->phase = (phase / 255.0f) * 2.0f * M_PI;
+            b->freq_hz = (period > 0) ? (1000.0f / period) : 1.0f; // period in ms
+            
+            // Determine wave type based on effect type from Set Effect
+            // param1 stores waveform: 0=sine, 1=square, 2=triangle, 3=sawtooth
+            
+            if (ffb_verbose) {
+                Serial.printf("FFB: Set Periodic idx=%d mag=%.3f freq=%.2f phase=%.2f\n",
+                    effect_idx, b->magnitude, b->freq_hz, b->phase);
+            }
+        } break;
+
+        case 0x08: { // Effect Operation Report (Start/Stop)
+            // Format: [effect_index, operation, loop_count]
+            if (len < 3) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            uint8_t operation = read_uint8(buf, 1); // 1=Start, 2=Start Solo, 3=Stop
+            uint8_t loop_count = read_uint8(buf, 2);
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (!b || !b->in_use) break;
+            
+            if (operation == 1 || operation == 2) { // Start or Start Solo
+                if (operation == 2) { // Solo - stop all other effects
+                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                        if (i != effect_idx && blocks[i].in_use) {
+                            blocks[i].active = false;
+                        }
                     }
-                    // optional duration
-                    if (len >= 8) {
-                        uint32_t dur = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
-                        b->duration_ms = dur;
-                    }
-                    // If directional data is present (common in CreateEffect), parse next two bytes as direction (0..65535 polar)
-                    if (len >= 10) {
-                        uint16_t dir = (uint16_t)buf[8] | (uint16_t)buf[9] << 8;
-                        // convert 0..65535 to radians (0..2pi) and store in direction_rad
-                        float ang = ((float)dir / 65535.0f) * 2.0f * M_PI;
-                        b->direction_rad = ang;
-                        if (ffb_verbose) Serial.printf("FFB: block idx=%d dir_polar=%u rad=%.3f\n", idx, dir, ang);
-                    }
-                    b->start_time_ms = millis(); b->active = true;
                 }
-            } break;
-            case 0x02: { // start index
-                EffectBlock *b = get_block(idx);
-                if (b && b->in_use) { b->active = true; b->start_time_ms = millis(); }
-            } break;
-            case 0x03: { // stop index
-                EffectBlock *b = get_block(idx);
-                if (b && b->in_use) { b->active = false; }
-            } break;
-            case 0x04: { // remove index
-                EffectBlock *b = get_block(idx);
-                if (b && b->in_use) clear_block(b);
-            } break;
-            case 0x05: { // set periodic params
-                EffectBlock *b = get_block(idx);
-                if (b && (len >= 8)) {
-                    b->freq_hz = (float)buf[2];
-                    b->phase = (float)buf[3] / 255.0f * 2.0f * M_PI;
-                    int16_t mag = (int16_t)((uint16_t)buf[4] | (uint16_t)buf[5] << 8);
-                    b->magnitude = int16_to_unit(mag);
-                    b->param1 = buf[6]; // type
-                    b->gain = buf[7] / 255.0f;
-                    if (ffb_verbose) Serial.printf("FFB: set periodic idx=%d freq=%d phase=%.2f amp=%.3f type=%d gain=%.3f\n", idx, (int)b->freq_hz, b->phase, b->magnitude, (int)b->param1, b->gain);
+                b->active = true;
+                b->start_time_ms = millis();
+                
+                // Update global effect_playing for PID State report
+                extern uint8_t effect_playing;
+                effect_playing = effect_idx + 1;
+                
+                if (ffb_verbose) {
+                    Serial.printf("FFB: Start Effect idx=%d solo=%d\n", effect_idx, operation == 2);
                 }
-            } break;
-            default:
-                break;
-        }
+            } else if (operation == 3) { // Stop
+                b->active = false;
+                
+                // Check if any effects still playing
+                extern uint8_t effect_playing;
+                effect_playing = 0;
+                for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                    if (blocks[i].in_use && blocks[i].active) {
+                        effect_playing = i + 1;
+                        break;
+                    }
+                }
+                
+                if (ffb_verbose) {
+                    Serial.printf("FFB: Stop Effect idx=%d\n", effect_idx);
+                }
+            }
+        } break;
+
+        case 0x09: { // Block Free Report
+            // Format: [effect_index]
+            if (len < 1) break;
+            
+            uint8_t effect_idx = read_uint8(buf, 0);
+            if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
+            effect_idx--;
+            
+            EffectBlock *b = get_block(effect_idx);
+            if (b) {
+                clear_block(b);
+                
+                if (ffb_verbose) {
+                    Serial.printf("FFB: Block Free idx=%d\n", effect_idx);
+                }
+            }
+        } break;
+
+        case 0x0A: { // Device Control Report
+            // Format: [control] - 1=Enable, 2=Disable, 3=Stop All, 4=Reset, 5=Pause, 6=Continue
+            if (len < 1) break;
+            
+            uint8_t control = read_uint8(buf, 0);
+            extern bool actuators_enabled;
+            
+            switch (control) {
+                case 1: // Enable Actuators - CRITICAL
+                    actuators_enabled = true;
+                    if (ffb_verbose) Serial.println("FFB: Actuators ENABLED");
+                    break;
+                    
+                case 2: // Disable Actuators
+                    actuators_enabled = false;
+                    if (ffb_verbose) Serial.println("FFB: Actuators DISABLED");
+                    break;
+                    
+                case 3: // Stop All Effects
+                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                        if (blocks[i].in_use) blocks[i].active = false;
+                    }
+                    effect_playing = 0;
+                    if (ffb_verbose) Serial.println("FFB: Stop All Effects");
+                    break;
+                    
+                case 4: // Device Reset
+                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                        clear_block(&blocks[i]);
+                    }
+                    device_gain = 1.0f;
+                    actuators_enabled = true;
+                    effect_playing = 0;
+                    if (ffb_verbose) Serial.println("FFB: Device Reset");
+                    break;
+                    
+                case 5: // Pause
+                    // Could implement pausing logic
+                    break;
+                    
+                case 6: // Continue
+                    // Resume from pause
+                    break;
+            }
+        } break;
+
+        case 0x0B: { // Device Gain Report
+            // Format: [gain] (0-255)
+            if (len < 1) break;
+            
+            uint8_t gain = read_uint8(buf, 0);
+            device_gain = gain / 255.0f;
+            
+            if (ffb_verbose) {
+                Serial.printf("FFB: Device Gain set to %.2f\n", device_gain);
+            }
+        } break;
+
+        default:
+            // Unknown report ID
+            if (ffb_verbose) {
+                Serial.printf("FFB: Unknown report ID 0x%02X len=%d\n", report_id, len);
+            }
+            break;
     }
 }
