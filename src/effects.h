@@ -40,7 +40,7 @@ struct EffectBlock {
 // Max concurrent effect blocks to track
 #define MAX_EFFECT_BLOCKS 16
 
-// Enable verbose FFB debug printing when true
+// Enable verbose FFB debug printing when true (disabled to avoid USB conflicts)
 extern bool ffb_verbose;
 
 

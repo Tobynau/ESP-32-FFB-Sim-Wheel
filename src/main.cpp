@@ -49,39 +49,25 @@ const int USER_BUTTON_PIN = 0; // set to actual GPIO if available, e.g., 0
 // ========== CONTROL LOOP ==========
 
 void setup() {
-  Serial.begin(115200);
-  delay(2000); // Give time for serial to initialize
-  Serial.println("\n\n=== ESP32 FFB Wheel Starting ===");
-  
-  Serial.println("Initializing HID...");
   hid_init();
-  Serial.println("HID Initialized");
   
   // Encoder / gearing configuration
   const uint8_t ENCODER_I2C_ADDR = 0x06; // MT6701 default
   const float ENCODER_TO_MOTOR_RATIO = 5.0f; // encoder reads 5x motor
   const float MOTOR_TO_WHEEL_RATIO = 5.0f; // motor reads 5x wheel -> overall 25x
-  const int MT_UPDATE_MS = 50; // MT6701 internal update interval (ms)
+  const int MT_UPDATE_MS = 10; // MT6701 internal update interval (ms) - faster polling for high speed
   // Recommended ESP32-S3 default I2C pins (check your board docs) - using SDA=8, SCL=9
   const int I2C_SDA_PIN = 8;
   const int I2C_SCL_PIN = 9;
   
-  Serial.println("Initializing Encoder...");
-  Serial.printf("  I2C: SDA=%d, SCL=%d, Addr=0x%02X\n", I2C_SDA_PIN, I2C_SCL_PIN, ENCODER_I2C_ADDR);
   // Initialize encoder on I2C pins at CTRL_HZ sampling
   pot_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, ENCODER_TO_MOTOR_RATIO, MOTOR_TO_WHEEL_RATIO, MT_UPDATE_MS);
-  Serial.println("Encoder Initialized");
   
   delay(100);
   // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX) at 115200
-  // Assumption: VESC RX is connected to GPIO16 and VESC TX to GPIO15 (common wiring: RX<-TX, TX<-RX)
-  // If your wiring is reversed, swap the RX/TX pin order below.
-  Serial.println("Initializing VESC UART...");
   Serial1.begin(115200, SERIAL_8N1, 15, 16);
   // Attach VescUart to Serial1
   UART.setSerialPort(&Serial1);
-
-  Serial.println("VESC UART (Serial1) Initialized");
 
   device_gain = 1.0f;
   last_effect_time = millis();
@@ -90,9 +76,6 @@ void setup() {
   button_pin = USER_BUTTON_PIN;
   gear_ratio = (float)GEAR_RATIO;
   max_wheel_angle_rad = 2.0f * PI; // default: full rotation
-
-  Serial.println("=== Setup Complete ===\n");
-  hid_task();
 }
 
 
@@ -100,14 +83,8 @@ void setup() {
 void loop() {
   static uint32_t last_ctrl = 0;
   static uint32_t last_usb = 0;
-  static uint32_t last_debug = 0;
+  static uint16_t test_counter = 0;
   uint32_t now_us = usec();
-  
-  // Debug heartbeat every 5 seconds
-  if (millis() - last_debug > 5000) {
-    last_debug = millis();
-    Serial.println("Loop running...");
-  }
   
   // poll telemetry (non-blocking in this simple approach)
   // vesc_request_status5 will call UART.getVescValues()
@@ -120,6 +97,7 @@ void loop() {
   float vel_rads = pot_read_vel_rads();
   wheel_angle_rad = angle_rad;
   wheel_vel_rads = vel_rads;
+  
   float tau = mix_effects(wheel_angle_rad, wheel_vel_rads);
   // Convert torque at wheel to motor torque using gear ratio
   float motor_tau = tau / gear_ratio;
@@ -129,6 +107,7 @@ void loop() {
   }
   if ((millis() - last_usb) >= (1000U / ANGLE_REPORT_HZ)) {
     last_usb = millis();
-  usb_send_joystick(wheel_angle_rad);
+    // Now use real encoder value
+    usb_send_joystick(wheel_angle_rad);
   }
 }

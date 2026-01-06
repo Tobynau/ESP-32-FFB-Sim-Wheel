@@ -170,50 +170,37 @@ uint8_t axis[3]; // 2 bytes for X, 1 byte for button/padding
 int button_pin = 0; // 0 = unused
 
 void usb_send_joystick(float angle_rad) {
-  if (pot_update()) {
-    float ang = pot_read_angle_rad();
-    int16_t v = angle_to_hid16(ang);
-    axis[0] = (uint8_t)(v & 0xFF);
-    axis[1] = (uint8_t)((v >> 8) & 0xFF);
-    axis[2] = 0;
+  float ang = angle_rad;
+  int16_t v = angle_to_hid16(ang);
+  axis[0] = (uint8_t)(v & 0xFF);
+  axis[1] = (uint8_t)((v >> 8) & 0xFF);
+  axis[2] = 0;
 
-    if (button_pin != 0 && digitalRead(button_pin) == LOW) {
-      axis[2] |= 0x01;
-    }
-
-    Device.send(axis, sizeof(axis));
+  if (button_pin != 0 && digitalRead(button_pin) == LOW) {
+    axis[2] |= 0x01;
   }
+
+  Device.send(axis, sizeof(axis));
 }
 
 void hid_init() {
-  Serial.setDebugOutput(true);
   USB.begin();
-
   Device.begin();
 }
 
 void hid_task() {
-  if (HID.ready()) {
-    pot_update();
-    float ang = pot_read_angle_rad();
-    int16_t v = angle_to_hid16(ang);
-    axis[0] = (uint8_t)(v & 0xFF);
-    axis[1] = (uint8_t)((v >> 8) & 0xFF);
-    axis[2] = 0;
+  // Remove the HID.ready() check - just always send
+  pot_update();
+  float ang = pot_read_angle_rad();
+  int16_t v = angle_to_hid16(ang);
+  axis[0] = (uint8_t)(v & 0xFF);
+  axis[1] = (uint8_t)((v >> 8) & 0xFF);
+  axis[2] = 0;
 
-    if (button_pin != 0 && digitalRead(button_pin) == LOW) axis[2] |= 0x01;
+  if (button_pin != 0 && digitalRead(button_pin) == LOW) axis[2] |= 0x01;
 
-    Device.send(axis, sizeof(axis));
-    
-    // Debug output every second
-    static unsigned long last_debug = 0;
-    if (millis() - last_debug > 1000) {
-      last_debug = millis();
-      Serial.printf("HID: angle=%.3f rad, HID_value=%d\n", ang, v);
-    }
-    
-    delay(10);
-  }
+  Device.send(axis, sizeof(axis));
+  delay(10);
 }
 
 // ----------------------
