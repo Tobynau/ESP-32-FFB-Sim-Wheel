@@ -23,7 +23,9 @@ static float overall_ratio = 1.0f; // encoder turns per wheel turn
 static bool read_encoder_turns(float *out_turns) {
     if (!out_turns) return false;
     if (!encoderPtr) return false;
-    // use the library-provided getTurns() which returns accumulator/COUNTS_PER_REVOLUTION
+    
+    // The library's background task should be updating automatically
+    // Just read the value
     float turns = encoderPtr->getTurns();
     if (!isfinite(turns)) return false;
     *out_turns = turns;
@@ -38,29 +40,22 @@ void pot_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_add
     motor_to_wheel_ratio = motor_to_wheel;
     if (sample_hz == 0) sample_hz = 1000;
     sample_interval_us = 1000000UL / sample_hz;
-    // Initialize I2C with specified pins BEFORE creating encoder
-    Wire.begin(i2c_sda, i2c_scl);
-    Wire.setClock(400000);
     
-    // initialize encoder library with provided address
+    // initialize encoder library with provided address and pins
     if (encoderPtr) {
         delete encoderPtr;
         encoderPtr = nullptr;
     }
-    // MT6701 constructor: (address, update_interval_ms, rpm_threshold, rpm_filter_size)
-    // Use library defaults for rpm_threshold and rpm_filter_size
+    
+    // MT6701 constructor now accepts pins: (address, update_interval_ms, rpm_threshold, rpm_filter_size, sda, scl)
     if (mt_update_ms > 0) {
-        encoderPtr = new MT6701(i2c_addr, mt_update_ms, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE);
+        encoderPtr = new MT6701(i2c_addr, mt_update_ms, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda, i2c_scl);
     } else {
-        encoderPtr = new MT6701(i2c_addr, MT6701::UPDATE_INTERVAL, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE);
+        encoderPtr = new MT6701(i2c_addr, MT6701::UPDATE_INTERVAL, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda, i2c_scl);
     }
     
-    // NOTE: MT6701::begin() calls Wire.begin() again without pins, which resets to defaults
-    // We need to modify the library or work around this
-    // For now, call begin() then re-initialize with our pins
+    // Now begin() will use our pins
     encoderPtr->begin();
-    Wire.begin(i2c_sda, i2c_scl);
-    Wire.setClock(400000);
     // small delay to let bus settle
     delay(5);
     float turns = 0.0f;
@@ -72,9 +67,7 @@ void pot_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_add
         float wheel_turns = turns / overall_ratio;
         angle = fmodf(wheel_turns, 1.0f) * 2.0f * PI;
         if (angle < 0) angle += 2.0f * PI;
-        Serial.printf("pot_init: encoder_turns=%.3f wheel_turns=%.3f angle_rad=%.3f\n", turns, wheel_turns, angle);
     } else {
-        Serial.println("pot_init: ERROR - Failed to read encoder!");
         angle = 0.0f;
         last_encoder_turns = 0.0f;
     }

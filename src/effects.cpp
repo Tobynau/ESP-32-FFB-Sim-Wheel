@@ -35,7 +35,7 @@ float effect_conditional_param = 0.0f;
 float gear_ratio = 1.0f; // motor:wheel
 float max_wheel_angle_rad = 2.0f * M_PI; // default full rotation
 
-bool ffb_verbose = true;
+bool ffb_verbose = false; // Disabled to avoid USB/Serial conflicts
 
 // Effect block storage for more complete FFB handling
 static EffectBlock blocks[MAX_EFFECT_BLOCKS];

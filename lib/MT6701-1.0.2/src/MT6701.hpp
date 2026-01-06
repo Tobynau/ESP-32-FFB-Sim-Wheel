@@ -21,7 +21,9 @@ public:
     MT6701(uint8_t device_address = DEFAULT_ADDRESS,
            int update_interval = UPDATE_INTERVAL,
            int rpm_threshold = RPM_THRESHOLD,
-           int rpm_filter_size = RPM_FILTER_SIZE);
+           int rpm_filter_size = RPM_FILTER_SIZE,
+           int sda_pin = -1,
+           int scl_pin = -1);
     ~MT6701();
     void begin();
     float getAngleRadians();
@@ -36,6 +38,8 @@ public:
 private:
     uint8_t address;
     int updateIntervalMillis;
+    int sdaPin;
+    int sclPin;
     std::atomic<unsigned long> lastUpdateTime{0};
     std::atomic<int> count{0};
     std::atomic<int> accumulator{0};

@@ -10,11 +10,13 @@
  * @param update_interval Interval in milliseconds at which to update the encoder count.
  * @param rpm_filter_size Size of the RPM moving average filter.
  */
-MT6701::MT6701(uint8_t device_address, int update_interval, int rpm_threshold, int rpm_filter_size)
+MT6701::MT6701(uint8_t device_address, int update_interval, int rpm_threshold, int rpm_filter_size, int sda_pin, int scl_pin)
     : address(device_address),
       updateIntervalMillis(update_interval),
       rpmThreshold(rpm_threshold),
-      rpmFilterSize(rpm_filter_size)
+      rpmFilterSize(rpm_filter_size),
+      sdaPin(sda_pin),
+      sclPin(scl_pin)
 {
     rpmFilterMutex = xSemaphoreCreateMutex();
 }
@@ -33,7 +35,11 @@ MT6701::~MT6701()
  */
 void MT6701::begin()
 {
-    Wire.begin();
+    if (sdaPin >= 0 && sclPin >= 0) {
+        Wire.begin(sdaPin, sclPin);
+    } else {
+        Wire.begin();
+    }
     Wire.setClock(400000);
     xTaskCreatePinnedToCore(updateTask, "MT6701 update task", 2048, this, 2, NULL, 1);
     xSemaphoreTake(rpmFilterMutex, portMAX_DELAY);
