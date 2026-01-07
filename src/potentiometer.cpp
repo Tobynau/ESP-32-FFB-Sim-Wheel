@@ -9,7 +9,8 @@ static unsigned long sample_interval_us = 1000; // default 1kHz
 static unsigned long last_sample_us = 0;
 // Continuous turns from encoder
 static float last_encoder_turns = 0.0f;
-static float angle = 0.0f; // wheel angle in radians (0..2PI)
+static float angle = 0.0f; // wheel angle in radians (absolute)
+static float center_angle = 0.0f; // center position at power-on (radians)
 static float vel = 0.0f;   // wheel angular velocity rad/s
 static bool initialized = false;
 static MT6701 *encoderPtr = nullptr; // pointer to MT6701 instance
@@ -67,8 +68,11 @@ void pot_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_add
         float wheel_turns = turns / overall_ratio;
         angle = fmodf(wheel_turns, 1.0f) * 2.0f * PI;
         if (angle < 0) angle += 2.0f * PI;
+        // Store this as center position (assume wheel is centered at power-on)
+        center_angle = angle;
     } else {
         angle = 0.0f;
+        center_angle = 0.0f;
         last_encoder_turns = 0.0f;
     }
     vel = 0.0f;
@@ -114,6 +118,16 @@ bool pot_update() {
 
 float pot_read_angle_rad() {
     return angle;
+}
+
+// Get angle relative to center (power-on position)
+// Returns angle in range -PI..PI where 0 is center
+float pot_read_centered_angle_rad() {
+    float centered = angle - center_angle;
+    // Normalize to -PI..PI
+    while (centered > PI) centered -= 2.0f * PI;
+    while (centered < -PI) centered += 2.0f * PI;
+    return centered;
 }
 
 float pot_read_vel_rads() {
