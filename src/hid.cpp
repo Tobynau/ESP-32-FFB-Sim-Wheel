@@ -403,12 +403,24 @@ static const uint8_t report_descriptor[] = {
 // ----------------------
 // Convert centered angle (-PI..PI) to HID report value (-32767..32767)
 auto angle_to_hid16 = [](float angle_rad) -> int16_t {
-  // angle_rad is now centered: -PI (full left) to +PI (full right), 0 = center
+  // Safety check for invalid values
+  if (!isfinite(angle_rad)) {
+    return 0; // Return center if NaN or infinite
+  }
+  
+  // Clamp input to -PI..PI range
+  float clamped = angle_rad;
+  if (clamped > PI) clamped = PI;
+  if (clamped < -PI) clamped = -PI;
+  
   // Map to -32767..32767 where 0 = center
-  float scaled = (angle_rad / PI) * 32767.0f; // -PI->-32767, 0->0, +PI->32767
+  float scaled = (clamped / PI) * 32767.0f;
   int v = (int)roundf(scaled);
+  
+  // Extra safety clamp
   if (v < -32767) v = -32767;
   if (v > 32767) v = 32767;
+  
   return (int16_t)v;
 };
 
@@ -476,7 +488,9 @@ uint8_t axis[3]; // 2 bytes for X, 1 byte for button/padding
 int button_pin = 0; // 0 = unused
 
 void usb_send_joystick(float angle_rad) {
-  float ang = angle_rad;
+  // Safety: ensure angle is finite
+  float ang = isfinite(angle_rad) ? angle_rad : 0.0f;
+  
   int16_t v = angle_to_hid16(ang);
   axis[0] = (uint8_t)(v & 0xFF);
   axis[1] = (uint8_t)((v >> 8) & 0xFF);
@@ -497,7 +511,7 @@ void hid_init() {
 void hid_task() {
   // Remove the HID.ready() check - just always send
   pot_update();
-  float ang = pot_read_angle_rad();
+  float ang = pot_read_centered_angle_rad(); // Use centered angle (-PI..PI)
   int16_t v = angle_to_hid16(ang);
   axis[0] = (uint8_t)(v & 0xFF);
   axis[1] = (uint8_t)((v >> 8) & 0xFF);

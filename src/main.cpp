@@ -89,6 +89,7 @@ void loop() {
   static uint32_t last_ctrl = 0;
   static uint32_t last_usb = 0;
   static uint16_t test_counter = 0;
+  static bool first_usb_send = true;
   uint32_t now_us = usec();
   
   // poll telemetry (non-blocking in this simple approach)
@@ -113,6 +114,11 @@ void loop() {
   }
   if ((millis() - last_usb) >= (1000U / ANGLE_REPORT_HZ)) {
     last_usb = millis();
+    // Wait a bit after boot before sending USB data to ensure encoder is ready
+    if (first_usb_send && millis() < 500) {
+      return; // Skip first 500ms of USB sends
+    }
+    first_usb_send = false;
     // Now use real encoder value
     usb_send_joystick(wheel_angle_rad);
   }
