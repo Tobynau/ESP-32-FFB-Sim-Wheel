@@ -123,10 +123,17 @@ float pot_read_angle_rad() {
 // Get angle relative to center (power-on position)
 // Returns angle in range -PI..PI where 0 is center
 float pot_read_centered_angle_rad() {
+    if (!initialized) return 0.0f; // Safety: return center if not initialized
+    
     float centered = angle - center_angle;
+    
+    // Safety check
+    if (!isfinite(centered)) return 0.0f;
+    
     // Normalize to -PI..PI
     while (centered > PI) centered -= 2.0f * PI;
     while (centered < -PI) centered += 2.0f * PI;
+    
     return centered;
 }
 
