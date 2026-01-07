@@ -44,9 +44,10 @@ struct EffectBlock {
 extern bool ffb_verbose;
 
 
-// Configuration: gearing and max wheel angle (radians)
-extern float gear_ratio; // motor:wheel (e.g. 10 means motor turns 10x for 1 wheel turn)
-extern float max_wheel_angle_rad; // maximum mechanical wheel travel (radians)
+// Configuration: gearing and max wheel angle
+extern float gear_ratio; // motor:wheel ratio for torque calculation (e.g. 5 means motor turns 5x for 1 wheel turn)
+extern float max_wheel_angle_deg; // maximum wheel rotation in degrees (e.g. 270 for typical racing wheel)
+extern float angle_limit_stiffness; // spring stiffness for angle limiting (Nm/rad)
 
 extern float device_gain;
 extern unsigned long last_effect_time;

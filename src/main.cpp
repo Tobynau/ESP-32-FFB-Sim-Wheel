@@ -17,10 +17,14 @@
 //
 
 #define WHEEL_CPR    4096.0f
-// User-configurable gearing: motor turns per wheel turn
-#define GEAR_RATIO   5.0f
-// Conversion placeholder: Nm -> Amps, user should calibrate
-#define TORQUE_TO_CURRENT  1.0f
+// Gearing ratios:
+// - Encoder to motor: encoder spins faster than motor (e.g., 5:1)
+// - Motor to wheel: motor spins faster than wheel (e.g., 5:1)
+// - Overall encoder to wheel: 5 * 5 = 25:1
+#define MOTOR_TO_WHEEL_GEAR_RATIO   5.0f  // Motor turns per wheel turn (used for FFB torque calculation)
+// Conversion: Nm -> Amps (typical VESC with 8-10 pole motor: ~0.5-1.5 A/Nm)
+// Adjust this based on your motor's torque constant
+#define TORQUE_TO_CURRENT  1.5f
 #define CTRL_HZ     1000UL
 #define ANGLE_REPORT_HZ 200U
 
@@ -53,8 +57,8 @@ void setup() {
   
   // Encoder / gearing configuration
   const uint8_t ENCODER_I2C_ADDR = 0x06; // MT6701 default
-  const float ENCODER_TO_MOTOR_RATIO = 5.0f; // encoder reads 5x motor
-  const float MOTOR_TO_WHEEL_RATIO = 5.0f; // motor reads 5x wheel -> overall 25x
+  const float ENCODER_TO_MOTOR_RATIO = 5.0f; // encoder spins 5x per motor revolution
+  const float MOTOR_TO_WHEEL_RATIO = 5.0f; // motor spins 5x per wheel revolution -> overall 25:1
   const int MT_UPDATE_MS = 10; // MT6701 internal update interval (ms) - faster polling for high speed
   // Recommended ESP32-S3 default I2C pins (check your board docs) - using SDA=8, SCL=9
   const int I2C_SDA_PIN = 8;
@@ -72,10 +76,11 @@ void setup() {
   device_gain = 1.0f;
   last_effect_time = millis();
 
-  // configure button pin and effect module gearing
+  // configure button pin and FFB gearing
   button_pin = USER_BUTTON_PIN;
-  gear_ratio = (float)GEAR_RATIO;
-  max_wheel_angle_rad = 2.0f * PI; // default: full rotation
+  gear_ratio = MOTOR_TO_WHEEL_GEAR_RATIO; // for FFB torque calculation: wheel_torque / gear_ratio = motor_torque
+  max_wheel_angle_deg = 270.0f; // 270 degrees max rotation (adjustable)
+  angle_limit_stiffness = 100.0f; // Nm/rad spring force at limits (adjustable)
 }
 
 
@@ -93,9 +98,10 @@ void loop() {
     last_ctrl += (1000000UL / CTRL_HZ);
   // update potentiometer sampling
   pot_update();
-  float angle_rad = pot_read_angle_rad();
+  // Use centered angle (relative to power-on position) for all FFB and game output
+  float centered_angle = pot_read_centered_angle_rad();
   float vel_rads = pot_read_vel_rads();
-  wheel_angle_rad = angle_rad;
+  wheel_angle_rad = centered_angle;
   wheel_vel_rads = vel_rads;
   
   float tau = mix_effects(wheel_angle_rad, wheel_vel_rads);

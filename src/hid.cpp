@@ -14,7 +14,7 @@ USBHID HID;
 static const uint8_t report_descriptor[] = {
   // Application Collection: Steering Wheel + FFB
   0x05, 0x01,        // Usage Page (Generic Desktop)
-  0x09, 0x08,        // Usage (Multi-axis Controller) 
+  0x09, 0x04,        // Usage (Multi-axis Controller) 
   0xA1, 0x01,        // Collection (Application)
   
     0x09, 0x01,            // Usage (Pointer)
@@ -401,13 +401,12 @@ static const uint8_t report_descriptor[] = {
 // ----------------------
 // Helpers
 // ----------------------
+// Convert centered angle (-PI..PI) to HID report value (-32767..32767)
 auto angle_to_hid16 = [](float angle_rad) -> int16_t {
-  const float two_pi = 2.0f * PI;
-  float r = angle_rad / two_pi; // 0..1
-  if (r < 0.0f) r += 1.0f;
-  if (r >= 1.0f) r -= 1.0f;
-  float scaled = r * 65534.0f;
-  int v = (int)roundf(scaled) - 32767;
+  // angle_rad is now centered: -PI (full left) to +PI (full right), 0 = center
+  // Map to -32767..32767 where 0 = center
+  float scaled = (angle_rad / PI) * 32767.0f; // -PI->-32767, 0->0, +PI->32767
+  int v = (int)roundf(scaled);
   if (v < -32767) v = -32767;
   if (v > 32767) v = 32767;
   return (int16_t)v;

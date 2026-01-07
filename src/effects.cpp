@@ -34,7 +34,8 @@ float effect_conditional_param = 0.0f;
 
 // Configuration
 float gear_ratio = 1.0f; // motor:wheel
-float max_wheel_angle_rad = 2.0f * M_PI; // default full rotation
+float max_wheel_angle_deg = 270.0f; // default 270 degrees (typical racing wheel)
+float angle_limit_stiffness = 100.0f; // Nm/rad - strength of angle limiting spring
 
 bool ffb_verbose = false; // Disabled to avoid USB/Serial conflicts
 
@@ -71,7 +72,8 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
     switch (b->type) {
         case ET_CONSTANT:
             if (ffb_verbose) Serial.printf("FFB: block const mag=%.3f gain=%.3f\n", mag, b->gain);
-            return mag * b->gain;
+            // magnitude is -1..1, scale to Nm (reasonable max ~10Nm for sim wheels)
+            return mag * b->gain * 10.0f;
         case ET_RAMP: {
             float frac = 0.0f;
             if (b->duration_ms > 0) frac = min(1.0f, (now - b->start_time_ms) / (float)b->duration_ms);
@@ -79,23 +81,27 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
             return v * b->gain;
         }
         case ET_SPRING: {
-            float k = b->param1; // stiffness
-            float center = b->param2; // center
+            float k = b->param1; // stiffness in Nm/rad
+            float center = b->param2; // center in radians
             if (ffb_verbose) Serial.printf("FFB: block spring k=%.3f center=%.3f\n", k, center);
-            return k * (center - angle) * b->gain;
+            float error = center - angle;
+            return k * error * b->gain;
         }
         case ET_DAMPER: {
-            float bcoef = b->param1;
+            float bcoef = b->param1; // damping coefficient in Nm/(rad/s)
+            // damper opposes motion
             return -bcoef * vel * b->gain;
         }
         case ET_FRICTION: {
-            float coeff = fabsf(mag);
+            float coeff = fabsf(mag) * 5.0f; // friction coefficient scaled to Nm
+            // friction opposes motion (velocity-independent coulomb friction)
+            if (fabsf(vel) < 0.01f) return 0.0f; // deadzone to avoid chatter
             return -coeff * (vel >= 0 ? 1.0f : -1.0f) * b->gain;
         }
         case ET_PERIODIC: {
             float phase = b->phase + 2.0f * M_PI * b->freq_hz * tsec;
             float val = 0.0f;
-            // b->param1 used for type
+            // b->param1 used for type: 0=sine, 1=square, 2=triangle, 3=sawtooth
             switch ((int)b->param1) {
                 case 0: val = sinf(phase); break;
                 case 1: val = (sinf(phase) >= 0) ? 1.0f : -1.0f; break;
@@ -103,7 +109,8 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
                 case 3: val = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break;
             }
             if (ffb_verbose) Serial.printf("FFB: block periodic type=%d freq=%.2f amp=%.3f\n", (int)b->param1, b->freq_hz, mag);
-            return val * mag * b->gain;
+            // magnitude scaled to Nm
+            return val * mag * b->gain * 8.0f;
         }
         case ET_CONDITION: {
             // For a simple condition: use param1 as deadband/threshold modifier
@@ -124,13 +131,28 @@ float mix_effects(float angle, float vel) {
     
     float tau = 0.0f;
     
+    // Angle limiting: enforce max wheel angle with spring force
+    // angle is now centered (-PI..PI) where 0 = center position
+    float max_angle_rad = max_wheel_angle_deg * M_PI / 180.0f;
+    float half_max = max_angle_rad / 2.0f;
+    
+    // Apply boundary spring force if exceeding limits
+    // angle > 0 is clockwise (right), angle < 0 is counter-clockwise (left)
+    if (angle > half_max) {
+        float excess = angle - half_max;
+        tau += -angle_limit_stiffness * excess; // push back toward limit
+    } else if (angle < -half_max) {
+        float excess = angle + half_max;
+        tau += -angle_limit_stiffness * excess; // push back toward limit
+    }
+    
     // Compute effect blocks (new system)
     for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
         tau += compute_block_force(&blocks[i], angle, vel);
     }
     
-    // Legacy effects (backward compatibility)
-    if (effect_constant_active) tau += effect_constant_nm;
+    // Legacy effects (backward compatibility) - scaled properly to Nm
+    if (effect_constant_active) tau += effect_constant_nm * 10.0f; // scale to Nm
     if (effect_spring_active)  tau += effect_spring_k * (effect_spring_center - angle);
     if (effect_damper_active)  tau += -effect_damper_b * vel;
     if (effect_ramp_active && effect_ramp_duration > 0) {
@@ -150,11 +172,11 @@ float mix_effects(float angle, float vel) {
     if (effect_inertia_active) {
         tau += -effect_inertia * accel;
     }
-    // friction
-    if (effect_friction_active) {
-        tau += -effect_friction_coeff * (vel >= 0 ? 1.0f : -1.0f);
+    // friction (legacy)
+    if (effect_friction_active && fabsf(vel) > 0.01f) {
+        tau += -effect_friction_coeff * 5.0f * (vel >= 0 ? 1.0f : -1.0f); // scale to Nm
     }
-    // periodic
+    // periodic (legacy)
     if (effect_periodic_active && effect_periodic_amp != 0.0f) {
         float t = (float)millis() / 1000.0f;
         float pval = 0.0f;
@@ -165,7 +187,7 @@ float mix_effects(float angle, float vel) {
             case 2: pval = asinf(sinf(phase)) * (2.0f / M_PI); break; // triangle (approx)
             case 3: pval = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break; // saw approx
         }
-        tau += effect_periodic_amp * pval;
+        tau += effect_periodic_amp * pval * 8.0f; // scale to Nm
     }
     
     // Apply device gain
@@ -300,11 +322,14 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             
             // Store parameters based on effect type
             if (b->type == ET_SPRING) {
-                b->param1 = int16_to_unit(pos_coeff) * 50.0f; // stiffness coefficient
+                // Spring: stiffness in Nm/rad, center in radians
+                b->param1 = fabsf(int16_to_unit(pos_coeff)) * 80.0f; // stiffness (Nm/rad)
                 b->param2 = int16_to_unit(cp_offset) * M_PI;  // center position in radians
             } else if (b->type == ET_DAMPER) {
-                b->param1 = int16_to_unit(pos_coeff) * 20.0f; // damping coefficient
+                // Damper: coefficient in Nm/(rad/s)
+                b->param1 = fabsf(int16_to_unit(pos_coeff)) * 15.0f; // damping (Nm/(rad/s))
             } else if (b->type == ET_FRICTION) {
+                // Friction: magnitude in Nm
                 b->magnitude = int16_to_unit(pos_coeff);
             }
             
