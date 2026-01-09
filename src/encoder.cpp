@@ -1,7 +1,8 @@
-#include "potentiometer.h"
+#include "encoder.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <MT6701.hpp>
+#include <main.cpp>
 
 static int i2c_sda = -1;
 static int i2c_scl = -1;
@@ -15,9 +16,7 @@ static float vel = 0.0f;   // wheel angular velocity rad/s
 static bool initialized = false;
 static MT6701 *encoderPtr = nullptr; // pointer to MT6701 instance
 // gearing: encoder -> motor -> wheel
-static float encoder_to_motor_ratio = 1.0f;
-static float motor_to_wheel_ratio = 1.0f;
-static float overall_ratio = 1.0f; // encoder turns per wheel turn
+
 
 // Internal: read absolute angle from MT6701 in radians [0..2PI)
 // read continuous turns from the encoder (can be many revolutions)
@@ -34,7 +33,7 @@ static bool read_encoder_turns(float *out_turns) {
 }
 
 // Initialize MT6701 on given SDA/SCL pins and sampling rate
-void pot_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_addr, float enc_to_motor_ratio, float motor_to_wheel, int mt_update_ms) {
+void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_addr, float enc_to_motor_ratio, float motor_to_wheel, int mt_update_ms) {
     i2c_sda = sda_pin;
     i2c_scl = scl_pin;
     encoder_to_motor_ratio = enc_to_motor_ratio;
@@ -80,7 +79,7 @@ void pot_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_add
     initialized = true;
 }
 
-bool pot_update() {
+bool encoder_update() {
     if (!initialized) return false;
     unsigned long now = micros();
     if ((now - last_sample_us) < sample_interval_us) return false;
@@ -116,13 +115,13 @@ bool pot_update() {
     return true;
 }
 
-float pot_read_angle_rad() {
+float encoder_read_angle_rad() {
     return angle;
 }
 
 // Get angle relative to center (power-on position)
 // Returns angle in range -PI..PI where 0 is center
-float pot_read_centered_angle_rad() {
+float encoder_read_centered_angle_rad() {
     if (!initialized) return 0.0f; // Safety: return center if not initialized
     
     float centered = angle - center_angle;
@@ -137,6 +136,6 @@ float pot_read_centered_angle_rad() {
     return centered;
 }
 
-float pot_read_vel_rads() {
+float encoder_read_vel_rads() {
     return vel;
 }

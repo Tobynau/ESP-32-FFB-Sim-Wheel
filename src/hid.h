@@ -14,7 +14,8 @@ void hid_task();
 void on_hid_set_report(uint8_t report_id, uint8_t *buf, uint16_t len);
 
 // Configurable pins
-extern int button_pin;
+extern int left_paddle_pin;
+extern int right_paddle_pin;
 
 // PID State globals - accessed from effects.cpp
 extern bool actuators_enabled;
