@@ -2,7 +2,7 @@
 #include "effects.h"
 #include <math.h>
 #include <Arduino.h>
-#include "potentiometer.h"
+#include "encoder.h"
 
 #include "USB.h"
 #include "USBHID.h"
@@ -510,8 +510,8 @@ void hid_init() {
 
 void hid_task() {
   // Remove the HID.ready() check - just always send
-  pot_update();
-  float ang = pot_read_centered_angle_rad(); // Use centered angle (-PI..PI)
+  encoder_update();
+  float ang = encoder_read_centered_angle_rad(); // Use centered angle (-PI..PI)
   int16_t v = angle_to_hid16(ang);
   axis[0] = (uint8_t)(v & 0xFF);
   axis[1] = (uint8_t)((v >> 8) & 0xFF);
