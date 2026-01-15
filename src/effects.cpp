@@ -60,7 +60,7 @@ static void clear_block(EffectBlock *b) {
 }
 
 // Compute a block's contribution to torque based on its type and current time
-static float compute_block_force(EffectBlock *b, float angle, float vel) {
+static float compute_block_force(EffectBlock *b, float angle, float vel, float accel) {
     if (!b || !b->in_use || !b->active) return 0.0f;
     uint32_t now = millis();
     if (b->duration_ms > 0 && (now - b->start_time_ms) >= b->duration_ms) {
@@ -92,6 +92,11 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
             // damper opposes motion
             return -bcoef * vel * b->gain;
         }
+        case ET_INERTIA: {
+            float mass = b->param1; // Moment of Inertia
+            // inertia opposes acceleration
+            return -mass * accel * b->gain;
+        }
         case ET_FRICTION: {
             float coeff = fabsf(mag) * 5.0f; // friction coefficient scaled to Nm
             // friction opposes motion (velocity-independent coulomb friction)
@@ -101,14 +106,16 @@ static float compute_block_force(EffectBlock *b, float angle, float vel) {
         case ET_PERIODIC: {
             float phase = b->phase + 2.0f * M_PI * b->freq_hz * tsec;
             float val = 0.0f;
-            // b->param1 used for type: 0=sine, 1=square, 2=triangle, 3=sawtooth
-            switch ((int)b->param1) {
-                case 0: val = sinf(phase); break;
-                case 1: val = (sinf(phase) >= 0) ? 1.0f : -1.0f; break;
-                case 2: val = asinf(sinf(phase)) * (2.0f / M_PI); break;
-                case 3: val = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break;
+            // b->param1 used for type: 0=sine, 1=square, 2=triangle, 3=sawup, 4=sawdown
+            int ptype = (int)b->param1;
+            switch (ptype) {
+                case 0: val = sinf(phase); break; // sine
+                case 1: val = (sinf(phase) >= 0) ? 1.0f : -1.0f; break; // square
+                case 2: val = asinf(sinf(phase)) * (2.0f / M_PI); break; // triangle
+                case 3: val = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break; // saw up
+                case 4: val = -(fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f); break; // saw down (inverted saw up)
             }
-            if (ffb_verbose) Serial.printf("FFB: block periodic type=%d freq=%.2f amp=%.3f\n", (int)b->param1, b->freq_hz, mag);
+            if (ffb_verbose) Serial.printf("FFB: block periodic type=%d freq=%.2f amp=%.3f\n", ptype, b->freq_hz, mag);
             // magnitude scaled to Nm
             return val * mag * b->gain * 8.0f;
         }
@@ -129,6 +136,20 @@ float mix_effects(float angle, float vel) {
         return 0.0f; // No force if actuators disabled
     }
     
+    // Calculate acceleration for Inertia effects
+    static float last_vel = 0.0f;
+    static unsigned long last_calc = 0;
+    unsigned long now = millis();
+    float dt = (now - last_calc) / 1000.0f;
+    if (dt <= 0) dt = 0.001f;
+    last_calc = now;
+    
+    float accel = (vel - last_vel) / dt; 
+    // Low pass filter acceleration to reduce noise
+    static float filtered_accel = 0.0f;
+    filtered_accel = 0.1f * accel + 0.9f * filtered_accel;
+    last_vel = vel;
+    
     float tau = 0.0f;
     
     // Angle limiting: enforce max wheel angle with spring force
@@ -148,7 +169,7 @@ float mix_effects(float angle, float vel) {
     
     // Compute effect blocks (new system)
     for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
-        tau += compute_block_force(&blocks[i], angle, vel);
+        tau += compute_block_force(&blocks[i], angle, vel, filtered_accel);
     }
     
     // Legacy effects (backward compatibility) - scaled properly to Nm
@@ -166,11 +187,9 @@ float mix_effects(float angle, float vel) {
             tau += ramp_val;
         }
     }
-    static float last_vel = 0.0f;
-    float accel = (vel - last_vel) * CTRL_HZ;
-    last_vel = vel;
+
     if (effect_inertia_active) {
-        tau += -effect_inertia * accel;
+        tau += -effect_inertia * filtered_accel;
     }
     // friction (legacy)
     if (effect_friction_active && fabsf(vel) > 0.01f) {
@@ -249,15 +268,31 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             
             // Initialize the effect block
             b->in_use = 1;
-            b->type = effect_type; // Map directly: 1=constant, 3=spring, 4=damper, etc.
+            
+            // Map USB HID effect types to internal EffectType
+            switch (effect_type) {
+                case 1: b->type = ET_CONSTANT; break;
+                case 2: b->type = ET_RAMP; break;
+                case 3: b->type = ET_PERIODIC; b->param1 = 1; break; // Square
+                case 4: b->type = ET_PERIODIC; b->param1 = 0; break; // Sine
+                case 5: b->type = ET_PERIODIC; b->param1 = 2; break; // Triangle
+                case 6: b->type = ET_PERIODIC; b->param1 = 3; break; // SawUp
+                case 7: b->type = ET_PERIODIC; b->param1 = 4; break; // SawDown
+                case 8: b->type = ET_SPRING; break;
+                case 9: b->type = ET_DAMPER; break;
+                case 10: b->type = ET_INERTIA; break;
+                case 11: b->type = ET_FRICTION; break;
+                default: b->type = ET_NONE; break;
+            }
+            
             b->active = false; // Wait for Effect Operation command to start
             b->duration_ms = duration; // 0 = infinite
             b->gain = gain / 255.0f;
             b->start_time_ms = 0;
             
             if (ffb_verbose) {
-                Serial.printf("FFB: Set Effect idx=%d type=%d dur=%d gain=%.2f\n", 
-                    effect_idx, effect_type, duration, b->gain);
+                Serial.printf("FFB: Set Effect idx=%d type=%d (USB) -> %d dur=%d gain=%.2f\n", 
+                    effect_idx, effect_type, b->type, duration, b->gain);
             }
         } break;
 
@@ -331,11 +366,14 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             } else if (b->type == ET_FRICTION) {
                 // Friction: magnitude in Nm
                 b->magnitude = int16_to_unit(pos_coeff);
+            } else if (b->type == ET_INERTIA) {
+                // Inertia: mass coefficient 
+                b->param1 = fabsf(int16_to_unit(pos_coeff)); 
             }
             
             if (ffb_verbose) {
-                Serial.printf("FFB: Set Condition idx=%d cp=%d pos=%d neg=%d\n",
-                    effect_idx, cp_offset, pos_coeff, neg_coeff);
+                Serial.printf("FFB: Set Condition idx=%d type=%d cp=%d pos=%d neg=%d\n",
+                    effect_idx, b->type, cp_offset, pos_coeff, neg_coeff);
             }
         } break;
 

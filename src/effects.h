@@ -14,9 +14,10 @@ enum EffectType {
 	ET_RAMP = 2,          // USB PID: 0x27 (Ramp)
 	ET_SPRING = 3,        // USB PID: 0x40 (Spring)
 	ET_DAMPER = 4,        // USB PID: 0x41 (Damper)
-	ET_FRICTION = 5,      // USB PID: 0x42 (Inertia/Friction)
-	ET_PERIODIC = 6,      // USB PID: 0x30-0x34 (Sine, Square, Triangle, Saw)
-	ET_CONDITION = 7      // Generic condition-based effect
+	ET_INERTIA = 5,       // USB PID: 0x42 (Inertia)
+	ET_FRICTION = 6,      // USB PID: 0x43 (Friction)
+	ET_PERIODIC = 7,      // USB PID: 0x30-0x34 (Sine, Square, Triangle, Saw)
+	ET_CONDITION = 8      // Generic condition-based effect
 };
 
 // Small effect block structure used by the firmware
