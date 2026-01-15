@@ -13,7 +13,7 @@
 // motor_to_wheel_ratio: how many motor revolutions per wheel revolution (e.g., 5.0 = motor spins 5x wheel)
 // Note: Overall encoder-to-wheel ratio = encoder_to_motor_ratio * motor_to_wheel_ratio (e.g., 5 * 5 = 25)
 // mt_update_ms: optional MT6701 internal update interval in milliseconds (default library value)
-void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_addr = 0x06, float encoder_to_motor_ratio, float motor_to_wheel_ratio, int mt_update_ms = -1);
+void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c_addr, float encoder_to_motor_ratio, float motor_to_wheel_ratio, int mt_update_ms = -1);
 
 // Read current angle in radians (0..2*PI) - absolute position
 float encoder_read_angle_rad();

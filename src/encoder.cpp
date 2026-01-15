@@ -2,7 +2,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MT6701.hpp>
-#include <main.cpp>
 
 static int i2c_sda = -1;
 static int i2c_scl = -1;
@@ -16,6 +15,9 @@ static float vel = 0.0f;   // wheel angular velocity rad/s
 static bool initialized = false;
 static MT6701 *encoderPtr = nullptr; // pointer to MT6701 instance
 // gearing: encoder -> motor -> wheel
+static float encoder_to_motor_ratio = 5.0f;
+static float motor_to_wheel_ratio = 5.0f;
+static float overall_ratio = 25.0f;
 
 
 // Internal: read absolute angle from MT6701 in radians [0..2PI)

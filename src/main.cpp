@@ -68,8 +68,9 @@ void setup() {
   encoder_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, encoder_to_motor_ratio, motor_to_wheel_ratio, MT_UPDATE_MS);
   
   delay(100);
-  // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX) at 115200
-  Serial1.begin(115200, SERIAL_8N1, 15, 16);
+  // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX) at 921600 (adjust VESC to match)
+  // Higher baud rate needed to sustain 1kHz loop with polling
+  Serial1.begin(921600, SERIAL_8N1, 15, 16);
   // Attach VescUart to Serial1
   UART.setSerialPort(&Serial1);
 
@@ -80,6 +81,9 @@ void setup() {
   //button_pin = USER_BUTTON_PIN;
   max_wheel_angle_deg = 270.0f; // 270 degrees max rotation (adjustable)
   angle_limit_stiffness = 300.0f; // Nm/rad spring force at limits (adjustable)
+  
+  // Set gear ratio for FFB calculations (Motor -> Wheel)
+  gear_ratio = motor_to_wheel_ratio;
 }
 
 
@@ -87,13 +91,17 @@ void setup() {
 void loop() {
   static uint32_t last_ctrl = 0;
   static uint32_t last_usb = 0;
-  static uint16_t test_counter = 0;
+  static uint32_t last_telemetry = 0;
   static bool first_usb_send = true;
   uint32_t now_us = usec();
+  uint32_t now_ms = millis();
   
-  // poll telemetry (non-blocking)
-  // vesc_request_status5 will call UART.getVescValues()
-  vesc_request_status5();
+  // poll telemetry (non-blocking if possible, throttle to 50Hz to save UART bandwidth/time)
+  if ((now_ms - last_telemetry) >= 20) {
+    last_telemetry = now_ms;
+    vesc_request_status5();
+  }
+
   if ((now_us - last_ctrl) >= (1000000UL / CTRL_HZ)) {
     last_ctrl += (1000000UL / CTRL_HZ);
   // update potentiometer sampling
