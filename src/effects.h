@@ -4,6 +4,7 @@
 #include <Arduino.h>
 
 float mix_effects(float angle, float vel);
+bool ffb_has_active_effects();
 // Handle an incoming HID FFB report (report id + raw buffer)
 void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len);
 // Fill PID feature report payload for the requested report ID.

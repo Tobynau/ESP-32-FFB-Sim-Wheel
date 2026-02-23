@@ -57,6 +57,7 @@ const int Right_padle = 1;
 // ========== CONTROL LOOP ==========
 
 void setup() {
+  Serial.begin(115200);
   hid_init();
   
   // Encoder / gearing configuration
@@ -124,11 +125,12 @@ void loop() {
   // Map motor torque to current (simple linear scale, user-calibrate TORQUE_TO_CURRENT)
   float amps = motor_tau * TORQUE_TO_CURRENT;
 
-  // Only take over motor control when there is actual force demand or very recent HID FFB traffic.
-  // This avoids idle UART spam but still guarantees command output during fftest/game playback.
+  // Take over motor control whenever an effect is active or there is real force demand.
+  // This avoids suppressing valid force commands when host actuator-enable sequencing differs.
   bool force_demand = fabsf(amps) > 0.02f;
+  bool active_effects = ffb_has_active_effects();
   bool recent_ffb_activity = (millis() - last_effect_time) < 1500;
-  bool ff_should_control = actuators_enabled && (force_demand || recent_ffb_activity);
+  bool ff_should_control = active_effects || force_demand || recent_ffb_activity;
   if (ff_should_control) {
     vesc_set_current(amps);
     vesc_control_active = true;
