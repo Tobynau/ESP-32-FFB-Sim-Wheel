@@ -21,26 +21,28 @@ However, this is **not required** for functionality - Windows will work correctl
 - Motor powered separately by VESC (not from USB)
 - Total USB draw: Well within 500mA limit
 
-## Force Feedback Implementation Status
+## Force Feedback Implementation Status (Linux HID PID)
 
 ### ✅ Completed
-- Complete USB HID PID descriptor with all required collections
-- PID State Feature Report (Report ID 0x02) - **CRITICAL for Windows FFB detection**
+- Linux-compatible USB HID PID descriptor aligned with `hid-pidff`
+- Required Linux PID reports implemented:
+   - Set Effect (`Usage 0x21`, Report ID `0x03`)
+   - Effect Operation (`Usage 0x77`, Report ID `0x09`)
+   - Device Gain (`Usage 0x7D`, Report ID `0x0C`)
+   - PID Pool Feature (`Usage 0x7F`, Report ID `0x0F`)
+   - Block Load Feature (`Usage 0x89`, Report ID `0x0E`)
+   - Block Free (`Usage 0x90`, Report ID `0x0A`)
+   - Device Control (`Usage 0x96`, Report ID `0x0B`)
+   - Create New Effect Feature (`Usage 0xAB`, Report ID `0x0D`)
+- Optional/extended effect reports implemented:
+   - Set Envelope (`0x04`), Set Condition (`0x05`), Set Periodic (`0x06`), Set Constant (`0x07`), Set Ramp (`0x08`)
+- PID State Feature Report (Report ID `0x02`) retained for compatibility/diagnostics
   - Actuators Enabled flag
   - Safety Switch flag  
   - Effect Playing status
   - Effect Block Index
-- All PID Output Reports:
-  - Set Effect (0x03) - Create effect with type, duration, gain
-  - Set Envelope (0x04) - Attack/fade shaping
-  - Set Constant Force (0x05) - Direct torque control
-  - Set Condition (0x06) - Spring/Damper/Friction parameters
-  - Set Periodic (0x07) - Sine/Square/Triangle waves
-  - Effect Operation (0x08) - Start/Stop/Solo commands
-  - Block Free (0x09) - Deallocate effects
-  - Device Control (0x0A) - Enable/Disable actuators, Stop All, Reset
-  - Device Gain (0x0B) - Global FFB strength multiplier
 - Effect block system: 16 concurrent effects
+- Device-managed PID memory pool and block-load status reporting
 - Actuators enabled check in mix_effects()
 - Proper effect start/stop handling
 - Global device gain support
@@ -60,34 +62,33 @@ However, this is **not required** for functionality - Windows will work correctl
 - Real-time torque output at 1kHz
 - Self-powered operation (no PC software required)
 
-## Testing Procedure
+## Linux Testing Procedure (Ubuntu)
 
-1. **Device Recognition**
-   - Open Device Manager → Should show "USB Input Device" with no errors
-   - Open joy.cpl → Device should appear with working steering axis
+1. **Build + Flash**
+   - Flash firmware to ESP32-S3 (PlatformIO/Arduino workflow)
 
-2. **Force Feedback Detection**
-   - Open joy.cpl → Select device → Properties
-   - Look for "Force feedback is supported" message
-   - If missing, Windows didn't receive proper PID State Feature Report
+2. **Verify Linux sees FF capabilities**
+   - Install tools: `sudo apt install -y evtest joystick`
+   - Find event node: `grep -H . /sys/class/input/event*/device/name`
+   - Check capabilities: `evtest /dev/input/eventX`
+   - Confirm FF types include at least: `FF_CONSTANT`, `FF_PERIODIC`, `FF_SPRING`, `FF_DAMPER`, `FF_FRICTION`, `FF_INERTIA`, `FF_GAIN`
 
-3. **Test Forces**
-   - In joy.cpl Properties → "Test Forces" button
-   - Wheel should resist movement when button is clicked
-   - Try different force types (constant, spring, damper)
+3. **Run force feedback test**
+   - Run: `fftest /dev/input/eventX`
+   - Trigger constant/spring/periodic effects and verify wheel response
 
 4. **Game Integration**
-   - Launch racing sim (MudRunner, Assetto Corsa, etc.)
+   - Launch game (BeamNG.drive via Proton, MudRunner, etc.)
    - Configure steering axis in game settings
    - Enable force feedback in game options
    - Test in-game: should feel road bumps, centering force, collision effects
 
 ## Troubleshooting
 
-### "Force feedback is not supported" in joy.cpl
-- Check that actuators_enabled = true in hid.cpp
-- Verify _onGetFeature() is properly implemented
-- Use USB analyzer to confirm Feature Report 0x02 is being sent
+### Linux does not expose FF_* capabilities
+- Check kernel module path: `dmesg | grep -Ei 'hid|input|ff|pid'`
+- Confirm descriptor includes PID usages: `0x21,0x77,0x7D,0x7F,0x89,0x90,0x96,0xAB`
+- Verify `Create New Effect` and `Block Load` feature reports respond
 
 ### Forces not working in games
 - Check Device Control Report is received (Enable Actuators command)
@@ -95,7 +96,7 @@ However, this is **not required** for functionality - Windows will work correctl
 - Enable ffb_verbose in effects.cpp and check Serial output
 
 ### Weak or no resistance
-- Check Device Gain Report (should be 0-255, default 255)
+- Check Device Gain Report (16-bit, default full scale)
 - Verify VESC current limits (±2A default, can increase if needed)
 - Check mix_effects() is calculating non-zero torque values
 - Verify vesc_set_current() is being called from main loop
