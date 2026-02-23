@@ -1,7 +1,7 @@
 #include "vesc.h"
 #include <math.h>
 
-#define MAX_CURRENT_A 2.0f
+#define MAX_CURRENT_A 20.0f
 
 // VescUart instance
 VescUart UART;

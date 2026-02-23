@@ -28,6 +28,8 @@ static float overall_ratio = 25.0f; // encoder turns per wheel turn
 #define TORQUE_TO_CURRENT  1.5f
 #define CTRL_HZ     1000UL
 #define ANGLE_REPORT_HZ 200U
+#define VESC_UART_BAUD 115200UL
+#define VESC_ENABLE_TELEMETRY_POLL 0
 
 
 float wheel_angle_rad = 0.0f;
@@ -68,9 +70,9 @@ void setup() {
   encoder_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, encoder_to_motor_ratio, motor_to_wheel_ratio, MT_UPDATE_MS);
   
   delay(100);
-  // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX) at 921600 (adjust VESC to match)
-  // Higher baud rate needed to sustain 1kHz loop with polling
-  Serial1.begin(921600, SERIAL_8N1, 15, 16);
+  // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX).
+  // Keep default at 115200 for maximum compatibility with VESC UART app defaults.
+  Serial1.begin(VESC_UART_BAUD, SERIAL_8N1, 15, 16);
   // Attach VescUart to Serial1
   UART.setSerialPort(&Serial1);
 
@@ -93,14 +95,18 @@ void loop() {
   static uint32_t last_usb = 0;
   static uint32_t last_telemetry = 0;
   static bool first_usb_send = true;
+  static bool vesc_control_active = false;
   uint32_t now_us = usec();
   uint32_t now_ms = millis();
   
-  // poll telemetry (non-blocking if possible, throttle to 50Hz to save UART bandwidth/time)
-  if ((now_ms - last_telemetry) >= 20) {
+  // Poll telemetry sparingly (library call is blocking while waiting for response).
+  // Keep disabled by default so force loop timing and outgoing current commands are not starved.
+#if VESC_ENABLE_TELEMETRY_POLL
+  if ((now_ms - last_telemetry) >= 200) {
     last_telemetry = now_ms;
     vesc_request_status5();
   }
+#endif
 
   if ((now_us - last_ctrl) >= (1000000UL / CTRL_HZ)) {
     last_ctrl += (1000000UL / CTRL_HZ);
@@ -117,7 +123,20 @@ void loop() {
   float motor_tau = tau / gear_ratio;
   // Map motor torque to current (simple linear scale, user-calibrate TORQUE_TO_CURRENT)
   float amps = motor_tau * TORQUE_TO_CURRENT;
-  vesc_set_current(amps);
+
+  // Only take over motor control when there is actual force demand or very recent HID FFB traffic.
+  // This avoids idle UART spam but still guarantees command output during fftest/game playback.
+  bool force_demand = fabsf(amps) > 0.02f;
+  bool recent_ffb_activity = (millis() - last_effect_time) < 1500;
+  bool ff_should_control = actuators_enabled && (force_demand || recent_ffb_activity);
+  if (ff_should_control) {
+    vesc_set_current(amps);
+    vesc_control_active = true;
+  } else if (vesc_control_active) {
+    // Release motor once when FFB stops, then remain silent.
+    vesc_set_current(0.0f);
+    vesc_control_active = false;
+  }
   }
   if ((millis() - last_usb) >= (1000U / ANGLE_REPORT_HZ)) {
     last_usb = millis();

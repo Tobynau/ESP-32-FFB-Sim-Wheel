@@ -6,6 +6,8 @@
 float mix_effects(float angle, float vel);
 // Handle an incoming HID FFB report (report id + raw buffer)
 void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len);
+// Fill PID feature report payload for the requested report ID.
+uint16_t ffb_get_feature_report(uint8_t report_id, uint8_t *buffer, uint16_t len);
 
 // Effect block types (USB HID PID spec mapping)
 enum EffectType {
