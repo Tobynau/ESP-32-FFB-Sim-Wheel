@@ -15,9 +15,9 @@ static float vel = 0.0f;   // wheel angular velocity rad/s
 static bool initialized = false;
 static MT6701 *encoderPtr = nullptr; // pointer to MT6701 instance
 // gearing: encoder -> motor -> wheel
-static float encoder_to_motor_ratio = 5.0f;
-static float motor_to_wheel_ratio = 5.0f;
-static float overall_ratio = 25.0f;
+static float encoder_to_motor_ratio = 1.0f;
+static float motor_to_wheel_ratio = 1.0f;
+static float overall_ratio = 1.0f;
 
 
 // Internal: read absolute angle from MT6701 in radians [0..2PI)
@@ -122,7 +122,8 @@ float encoder_read_angle_rad() {
 }
 
 // Get angle relative to center (power-on position)
-// Returns angle in range -PI..PI where 0 is center
+// Returns continuous angle in radians where 0 is center.
+// Positive/negative values grow with rotation and are scaled by configured ratios.
 float encoder_read_centered_angle_rad() {
     if (!initialized) return 0.0f; // Safety: return center if not initialized
     
@@ -130,10 +131,6 @@ float encoder_read_centered_angle_rad() {
     
     // Safety check
     if (!isfinite(centered)) return 0.0f;
-    
-    // Normalize to -PI..PI
-    while (centered > PI) centered -= 2.0f * PI;
-    while (centered < -PI) centered += 2.0f * PI;
     
     return centered;
 }

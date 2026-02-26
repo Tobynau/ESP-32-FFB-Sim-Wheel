@@ -16,13 +16,13 @@
 
 #define WHEEL_CPR    4096.0f
 // Gearing ratios:
-// - Encoder to motor: encoder spins faster than motor (e.g., 5:1)
-// - Motor to wheel: motor spins faster than wheel (e.g., 5:1)
-// - Overall encoder to wheel: 5 * 5 = 25:1
+// - Encoder to motor: encoder spins faster than motor (set >1 if geared)
+// - Motor to wheel: motor spins faster than wheel (set >1 if geared)
+// - Overall encoder to wheel: encoder_to_motor_ratio * motor_to_wheel_ratio
 
-static float encoder_to_motor_ratio = 5.0f;
-static float motor_to_wheel_ratio = 5.0f;
-static float overall_ratio = 25.0f; // encoder turns per wheel turn
+static float encoder_to_motor_ratio = 1.0f;
+static float motor_to_wheel_ratio = 1.0f;
+static float overall_ratio = 1.0f; // encoder turns per wheel turn
 // Conversion: Nm -> Amps (typical VESC with 8-10 pole motor: ~0.5-1.5 A/Nm)
 // Adjust this based on your motor's torque constant
 #define TORQUE_TO_CURRENT  1.5f
@@ -82,7 +82,7 @@ void setup() {
 
   // configure button pin and FFB gearing
   //button_pin = USER_BUTTON_PIN;
-  max_wheel_angle_deg = 270.0f; // 270 degrees max rotation (adjustable)
+  max_wheel_angle_deg = 900.0f; // lock-to-lock steering range (adjustable)
   angle_limit_stiffness = 300.0f; // Nm/rad spring force at limits (adjustable)
   
   // Set gear ratio for FFB calculations (Motor -> Wheel)
