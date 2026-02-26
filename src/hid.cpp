@@ -28,23 +28,20 @@ static const uint8_t report_descriptor[] = {
 
       0x05, 0x09,                // Usage Page (Button)
       0x19, 0x01,
-      0x29, 0x01,
+      0x29, 0x08,
       0x15, 0x00,
       0x25, 0x01,
       0x75, 0x01,
-      0x95, 0x01,
+      0x95, 0x08,
       0x81, 0x02,
-      0x75, 0x07,
-      0x95, 0x01,
-      0x81, 0x03,
     0xC0,
 
     0x05, 0x0F,                  // Usage Page (PID)
 
-    // PID State (optional but useful)
+    // PID State Input report
     0x09, 0x92,                  // Usage (PID State Report)
     0xA1, 0x02,
-      0x85, 0x02,                // Report ID 2 (Feature)
+      0x85, 0x02,                // Report ID 2 (Input)
       0x09, 0x94,                // Actuators Enabled
       0x09, 0x95,                // Safety Switch
       0x09, 0x97,                // Effect Playing
@@ -52,16 +49,16 @@ static const uint8_t report_descriptor[] = {
       0x25, 0x01,
       0x75, 0x01,
       0x95, 0x03,
-      0xB1, 0x02,
+      0x81, 0x02,
       0x75, 0x05,
       0x95, 0x01,
-      0xB1, 0x03,
+      0x81, 0x03,
       0x09, 0x22,
       0x15, 0x00,
       0x25, 0x10,
       0x75, 0x08,
       0x95, 0x01,
-      0xB1, 0x02,
+      0x81, 0x02,
     0xC0,
 
     // Set Effect (required by Linux hid-pidff)
@@ -481,20 +478,20 @@ static const uint8_t report_descriptor[] = {
 // ----------------------
 // Helpers
 // ----------------------
-// Convert centered angle (-PI..PI) to HID report value (-32767..32767)
-auto angle_to_hid16 = [](float angle_rad) -> int16_t {
+// Convert centered angle to HID report value (-32767..32767) using a configurable half-range.
+auto angle_to_hid16 = [](float angle_rad, float half_range_rad) -> int16_t {
   // Safety check for invalid values
-  if (!isfinite(angle_rad)) {
+  if (!isfinite(angle_rad) || !isfinite(half_range_rad) || half_range_rad <= 0.0f) {
     return 0; // Return center if NaN or infinite
   }
   
-  // Clamp input to -PI..PI range
+  // Clamp input to configured output range
   float clamped = angle_rad;
-  if (clamped > PI) clamped = PI;
-  if (clamped < -PI) clamped = -PI;
+  if (clamped > half_range_rad) clamped = half_range_rad;
+  if (clamped < -half_range_rad) clamped = -half_range_rad;
   
   // Map to -32767..32767 where 0 = center
-  float scaled = (clamped / PI) * 32767.0f;
+  float scaled = (clamped / half_range_rad) * 32767.0f;
   int v = (int)roundf(scaled);
   
   // Extra safety clamp
@@ -554,11 +551,52 @@ CustomHIDDevice Device;
 uint8_t axis[3]; // 2 bytes for X, 1 byte for button/padding
 int button_pin = 0; // 0 = unused
 
+static bool pid_state_dirty = true;
+static uint8_t pid_state_last_status = 0xFF;
+static uint8_t pid_state_last_playing = 0xFF;
+static uint32_t pid_state_last_sent_ms = 0;
+
+static inline void fill_pid_state_report(uint8_t *status, uint8_t *playing) {
+  uint8_t local_status = 0;
+  uint8_t local_playing = effect_playing;
+  if (actuators_enabled) local_status |= 0x01;
+  if (safety_switch) local_status |= 0x02;
+  if (local_playing > 0) local_status |= 0x04;
+  if (status) *status = local_status;
+  if (playing) *playing = local_playing;
+}
+
+static void send_pid_state_if_needed() {
+  uint8_t status = 0;
+  uint8_t playing = 0;
+  fill_pid_state_report(&status, &playing);
+
+  uint32_t now = millis();
+  bool changed = (status != pid_state_last_status) || (playing != pid_state_last_playing);
+  bool periodic = (now - pid_state_last_sent_ms) >= 100;
+
+  if (!(pid_state_dirty || changed || periodic)) {
+    return;
+  }
+
+  uint8_t payload[2] = {status, playing};
+  HID.SendReport(2, payload, sizeof(payload));
+
+  pid_state_last_status = status;
+  pid_state_last_playing = playing;
+  pid_state_last_sent_ms = now;
+  pid_state_dirty = false;
+}
+
 void usb_send_joystick(float angle_rad) {
   // Safety: ensure angle is finite
   float ang = isfinite(angle_rad) ? angle_rad : 0.0f;
+  float half_range_rad = (max_wheel_angle_deg * PI / 180.0f) * 0.5f;
+  if (!isfinite(half_range_rad) || half_range_rad <= 0.0f) {
+    half_range_rad = PI;
+  }
   
-  int16_t v = angle_to_hid16(ang);
+  int16_t v = angle_to_hid16(ang, half_range_rad);
   axis[0] = (uint8_t)(v & 0xFF);
   axis[1] = (uint8_t)((v >> 8) & 0xFF);
   axis[2] = 0;
@@ -568,6 +606,7 @@ void usb_send_joystick(float angle_rad) {
   }
 
   Device.send(axis, sizeof(axis));
+  send_pid_state_if_needed();
 }
 
 void hid_init() {
@@ -578,8 +617,12 @@ void hid_init() {
 void hid_task() {
   // Remove the HID.ready() check - just always send
   encoder_update();
-  float ang = encoder_read_centered_angle_rad(); // Use centered angle (-PI..PI)
-  int16_t v = angle_to_hid16(ang);
+  float ang = encoder_read_centered_angle_rad(); // Use centered continuous angle
+  float half_range_rad = (max_wheel_angle_deg * PI / 180.0f) * 0.5f;
+  if (!isfinite(half_range_rad) || half_range_rad <= 0.0f) {
+    half_range_rad = PI;
+  }
+  int16_t v = angle_to_hid16(ang, half_range_rad);
   axis[0] = (uint8_t)(v & 0xFF);
   axis[1] = (uint8_t)((v >> 8) & 0xFF);
   axis[2] = 0;
@@ -587,7 +630,12 @@ void hid_task() {
   if (button_pin != 0 && digitalRead(button_pin) == LOW) axis[2] |= 0x01;
 
   Device.send(axis, sizeof(axis));
+  send_pid_state_if_needed();
   delay(10);
+}
+
+void hid_notify_pid_state_changed() {
+  pid_state_dirty = true;
 }
 
 // ----------------------

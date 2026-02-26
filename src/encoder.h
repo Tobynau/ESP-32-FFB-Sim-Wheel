@@ -18,7 +18,7 @@ void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c
 // Read current angle in radians (0..2*PI) - absolute position
 float encoder_read_angle_rad();
 
-// Read angle relative to center/power-on position (-PI..PI, 0=center)
+// Read angle relative to center/power-on position (continuous radians, 0=center)
 float encoder_read_centered_angle_rad();
 
 // Read current angular velocity in rad/s (simple derivative, filtered)

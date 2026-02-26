@@ -34,7 +34,7 @@ float effect_conditional_param = 0.0f;
 
 // Configuration
 float gear_ratio = 1.0f; // motor:wheel
-float max_wheel_angle_deg = 270.0f; // default 270 degrees (typical racing wheel)
+float max_wheel_angle_deg = 900.0f; // default 900 degrees lock-to-lock (typical sim wheel)
 float angle_limit_stiffness = 100.0f; // Nm/rad - strength of angle limiting spring
 
 bool ffb_verbose = false; // Disabled to avoid USB/Serial conflicts
@@ -337,6 +337,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             
             EffectBlock *b = get_block(effect_idx);
             if (!b) break;
+            bool was_in_use = b->in_use;
             
             uint16_t duration = (uint16_t)read_int16_safe(buf, len, 1, 0);
             uint16_t gain16 = (uint16_t)read_int16_safe(buf, len, 3, 65535);
@@ -379,6 +380,9 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             b->start_time_ms = 0;
             // Linux direction is 0..65535, map around circle to radians
             b->direction_rad = (direction / 65535.0f) * (2.0f * M_PI);
+            if (!was_in_use) {
+                update_ram_pool_available();
+            }
             
             if (ffb_verbose) {
                 Serial.printf("FFB: Set Effect idx=%d type=%d -> %d dur=%d gain=%.2f dir=%.2f\n", 
@@ -548,6 +552,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
                 if (ffb_verbose) {
                     Serial.printf("FFB: Start Effect idx=%d loops=%u\n", effect_idx, loop_count);
                 }
+                hid_notify_pid_state_changed();
             } else if (operation == 2) { // Stop
                 b->active = false;
                 
@@ -564,6 +569,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
                 if (ffb_verbose) {
                     Serial.printf("FFB: Stop Effect idx=%d\n", effect_idx);
                 }
+                hid_notify_pid_state_changed();
             }
         } break;
 
@@ -577,8 +583,19 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             
             EffectBlock *b = get_block(effect_idx);
             if (b) {
+                bool was_playing = (effect_playing == (uint8_t)(effect_idx + 1));
                 clear_block(b);
                 update_ram_pool_available();
+                if (was_playing) {
+                    effect_playing = 0;
+                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                        if (blocks[i].in_use && blocks[i].active) {
+                            effect_playing = i + 1;
+                            break;
+                        }
+                    }
+                }
+                hid_notify_pid_state_changed();
                 
                 if (ffb_verbose) {
                     Serial.printf("FFB: Block Free idx=%d\n", effect_idx);
@@ -596,11 +613,13 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             switch (control) {
                 case 1: // Enable Actuators - CRITICAL
                     actuators_enabled = true;
+                    hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Actuators ENABLED");
                     break;
                     
                 case 2: // Disable Actuators
                     actuators_enabled = false;
+                    hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Actuators DISABLED");
                     break;
                     
@@ -609,6 +628,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
                         if (blocks[i].in_use) blocks[i].active = false;
                     }
                     effect_playing = 0;
+                    hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Stop All Effects");
                     break;
                     
@@ -620,6 +640,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
                     actuators_enabled = true;
                     effect_playing = 0;
                     update_ram_pool_available();
+                    hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Device Reset");
                     break;
                     
@@ -723,7 +744,7 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
 uint16_t ffb_get_feature_report(uint8_t report_id, uint8_t *buffer, uint16_t len) {
     if (!buffer || len == 0) return 0;
 
-    // Report ID 2: PID State
+    // Report ID 2: PID State (descriptor exposes this as Input; keep GET_FEATURE fallback)
     if (report_id == 0x02) {
         if (len < 2) return 0;
         uint8_t status = 0;

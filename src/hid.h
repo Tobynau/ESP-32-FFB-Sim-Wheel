@@ -12,6 +12,7 @@ void hid_task();
 
 // Called by USB stack when a Set_Report/Output/Feature arrives
 void on_hid_set_report(uint8_t report_id, uint8_t *buf, uint16_t len);
+void hid_notify_pid_state_changed();
 
 // Configurable pins
 extern int left_paddle_pin;
