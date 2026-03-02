@@ -1,6 +1,7 @@
 #include "pedals.h"
 
 #include <math.h>
+#include <Wire.h>
 #include <MT6701.hpp>
 #include <HX711.h>
 
@@ -24,6 +25,11 @@ static uint16_t gas_hid = 0;
 static uint16_t brake_hid = 0;
 
 static uint32_t last_update_ms = 0;
+
+static bool i2c_device_present(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return (Wire.endTransmission(true) == 0);
+}
 
 static inline float clamp01(float v) {
     if (v < 0.0f) return 0.0f;
@@ -67,17 +73,25 @@ void pedals_init(
     if (brake_counts_fullscale < 1000) brake_counts_fullscale = 1000;
     brake_fullscale_counts = brake_counts_fullscale;
 
-    clutch_encoder = new MT6701(clutch_i2c_addr, 5, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda_pin, i2c_scl_pin);
-    gas_encoder = new MT6701(gas_i2c_addr, 5, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda_pin, i2c_scl_pin);
+    if (i2c_device_present(clutch_i2c_addr)) {
+        clutch_encoder = new MT6701(clutch_i2c_addr, 5, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda_pin, i2c_scl_pin);
+        clutch_encoder->begin();
+        delay(5);
+        float ct = clutch_encoder->getTurns();
+        clutch_zero_turns = isfinite(ct) ? ct : 0.0f;
+    } else {
+        clutch_zero_turns = 0.0f;
+    }
 
-    clutch_encoder->begin();
-    gas_encoder->begin();
-    delay(10);
-
-    float ct = clutch_encoder->getTurns();
-    float gt = gas_encoder->getTurns();
-    clutch_zero_turns = isfinite(ct) ? ct : 0.0f;
-    gas_zero_turns = isfinite(gt) ? gt : 0.0f;
+    if (i2c_device_present(gas_i2c_addr)) {
+        gas_encoder = new MT6701(gas_i2c_addr, 5, MT6701::RPM_THRESHOLD, MT6701::RPM_FILTER_SIZE, i2c_sda_pin, i2c_scl_pin);
+        gas_encoder->begin();
+        delay(5);
+        float gt = gas_encoder->getTurns();
+        gas_zero_turns = isfinite(gt) ? gt : 0.0f;
+    } else {
+        gas_zero_turns = 0.0f;
+    }
 
     brake_initialized = false;
     if (brake_hx711_dout_pin >= 0 && brake_hx711_sck_pin >= 0) {
@@ -110,7 +124,11 @@ void pedals_update() {
         if (isfinite(t)) {
             float norm = (t - clutch_zero_turns) / clutch_range_turns;
             clutch_hid = unit_to_hid16(norm);
+        } else {
+            clutch_hid = 0;
         }
+    } else {
+        clutch_hid = 0;
     }
 
     if (gas_encoder) {
@@ -118,7 +136,11 @@ void pedals_update() {
         if (isfinite(t)) {
             float norm = (t - gas_zero_turns) / gas_range_turns;
             gas_hid = unit_to_hid16(norm);
+        } else {
+            gas_hid = 0;
         }
+    } else {
+        gas_hid = 0;
     }
 
     if (brake_initialized && brake_loadcell.is_ready()) {
@@ -126,6 +148,8 @@ void pedals_update() {
         int32_t delta = raw - brake_zero_counts;
         float norm = (float)delta / (float)brake_fullscale_counts;
         brake_hid = unit_to_hid16(norm);
+    } else {
+        brake_hid = 0;
     }
 }
 
