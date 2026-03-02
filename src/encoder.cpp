@@ -9,8 +9,9 @@ static unsigned long sample_interval_us = 1000; // default 1kHz
 static unsigned long last_sample_us = 0;
 // Continuous turns from encoder
 static float last_encoder_turns = 0.0f;
-static float angle = 0.0f; // wheel angle in radians (absolute)
-static float center_angle = 0.0f; // center position at power-on (radians)
+static float angle = 0.0f; // wheel angle in radians (wrapped absolute 0..2PI)
+static float angle_continuous = 0.0f; // wheel angle in radians (continuous, unbounded)
+static float center_angle_continuous = 0.0f; // center position at power-on (continuous radians)
 static float vel = 0.0f;   // wheel angular velocity rad/s
 static bool initialized = false;
 static MT6701 *encoderPtr = nullptr; // pointer to MT6701 instance
@@ -66,14 +67,20 @@ void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c
         // compute wheel turns from encoder turns via ratios:
         // wheel_turns = encoder_turns / (encoder_to_motor_ratio * motor_to_wheel_ratio)
         overall_ratio = encoder_to_motor_ratio * motor_to_wheel_ratio; // encoder turns per wheel turn
+        if (!isfinite(overall_ratio) || fabsf(overall_ratio) < 1e-6f) {
+            overall_ratio = 1.0f;
+        }
+
         float wheel_turns = turns / overall_ratio;
-        angle = fmodf(wheel_turns, 1.0f) * 2.0f * PI;
+        angle_continuous = wheel_turns * 2.0f * PI;
+        angle = fmodf(angle_continuous, 2.0f * PI);
         if (angle < 0) angle += 2.0f * PI;
         // Store this as center position (assume wheel is centered at power-on)
-        center_angle = angle;
+        center_angle_continuous = angle_continuous;
     } else {
         angle = 0.0f;
-        center_angle = 0.0f;
+        angle_continuous = 0.0f;
+        center_angle_continuous = 0.0f;
         last_encoder_turns = 0.0f;
     }
     vel = 0.0f;
@@ -108,10 +115,10 @@ bool encoder_update() {
     vel = (alpha * new_vel) + (1.0f - alpha) * vel;
 
     // Update integrated wheel angle (tracks continuous rotations) from wheel_delta_turns
-    angle += wheel_delta_turns * 2.0f * PI;
-    // normalize angle to 0..2PI
-    while (angle < 0) angle += 2.0f * PI;
-    while (angle >= 2.0f * PI) angle -= 2.0f * PI;
+    angle_continuous += wheel_delta_turns * 2.0f * PI;
+    // Keep wrapped absolute representation for APIs expecting 0..2PI
+    angle = fmodf(angle_continuous, 2.0f * PI);
+    if (angle < 0) angle += 2.0f * PI;
 
     last_encoder_turns = new_turns;
     return true;
@@ -127,7 +134,7 @@ float encoder_read_angle_rad() {
 float encoder_read_centered_angle_rad() {
     if (!initialized) return 0.0f; // Safety: return center if not initialized
     
-    float centered = angle - center_angle;
+    float centered = angle_continuous - center_angle_continuous;
     
     // Safety check
     if (!isfinite(centered)) return 0.0f;

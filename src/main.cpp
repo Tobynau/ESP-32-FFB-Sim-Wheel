@@ -20,12 +20,12 @@
 // - Motor to wheel: motor spins faster than wheel (set >1 if geared)
 // - Overall encoder to wheel: encoder_to_motor_ratio * motor_to_wheel_ratio
 
-static float encoder_to_motor_ratio = 1.0f;
-static float motor_to_wheel_ratio = 1.0f;
-static float overall_ratio = 1.0f; // encoder turns per wheel turn
+static float encoder_to_motor_ratio = 5.0f;
+static float motor_to_wheel_ratio = 5.0f;
+static float overall_ratio = 25.0f; // encoder turns per wheel turn
 // Conversion: Nm -> Amps (typical VESC with 8-10 pole motor: ~0.5-1.5 A/Nm)
 // Adjust this based on your motor's torque constant
-#define TORQUE_TO_CURRENT  1.5f
+#define TORQUE_TO_CURRENT  5.0f
 #define CTRL_HZ     1000UL
 #define ANGLE_REPORT_HZ 200U
 #define VESC_UART_BAUD 115200UL
