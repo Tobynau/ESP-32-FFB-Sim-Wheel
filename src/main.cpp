@@ -26,9 +26,9 @@ static float motor_to_wheel_ratio = 5.0f;
 static float overall_ratio = 25.0f; // encoder turns per wheel turn
 // Conversion: Nm -> Amps (typical VESC with 8-10 pole motor: ~0.5-1.5 A/Nm)
 // Adjust this based on your motor's torque constant
-#define TORQUE_TO_CURRENT  5.0f
+#define TORQUE_TO_CURRENT  1.5f
 #define CTRL_HZ     1000UL
-#define ANGLE_REPORT_HZ 200U
+#define ANGLE_REPORT_HZ 500U
 #define VESC_UART_BAUD 115200UL
 #define VESC_ENABLE_TELEMETRY_POLL 0
 
@@ -42,6 +42,7 @@ const int LEFT_PADDLE_PIN = 4;
 const int RIGHT_PADDLE_PIN = 5;
 
 // Pedals: 2x MT6701 + 1x HX711 loadcell
+const bool PEDALS_ENABLED = false; // set true when pedal hardware is connected
 const uint8_t CLUTCH_ENCODER_I2C_ADDR = 0x07;
 const uint8_t GAS_ENCODER_I2C_ADDR = 0x08;
 const float CLUTCH_TRAVEL_TURNS = 0.25f;
@@ -78,16 +79,18 @@ void setup() {
   
   // Initialize encoder on I2C pins at CTRL_HZ sampling
   encoder_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, encoder_to_motor_ratio, motor_to_wheel_ratio, MT_UPDATE_MS);
-  pedals_init(
-      I2C_SDA_PIN,
-      I2C_SCL_PIN,
-      CLUTCH_ENCODER_I2C_ADDR,
-      GAS_ENCODER_I2C_ADDR,
-      CLUTCH_TRAVEL_TURNS,
-      GAS_TRAVEL_TURNS,
-      BRAKE_HX711_DOUT_PIN,
-      BRAKE_HX711_SCK_PIN,
-      BRAKE_FULLSCALE_COUNTS);
+  if (PEDALS_ENABLED) {
+    pedals_init(
+        I2C_SDA_PIN,
+        I2C_SCL_PIN,
+        CLUTCH_ENCODER_I2C_ADDR,
+        GAS_ENCODER_I2C_ADDR,
+        CLUTCH_TRAVEL_TURNS,
+        GAS_TRAVEL_TURNS,
+        BRAKE_HX711_DOUT_PIN,
+        BRAKE_HX711_SCK_PIN,
+        BRAKE_FULLSCALE_COUNTS);
+  }
 
   left_paddle_pin = LEFT_PADDLE_PIN;
   right_paddle_pin = RIGHT_PADDLE_PIN;
@@ -163,14 +166,17 @@ void loop() {
     vesc_control_active = false;
   }
   }
-  if ((millis() - last_usb) >= (1000U / ANGLE_REPORT_HZ)) {
-    last_usb = millis();
+  if ((now_us - last_usb) >= (1000000UL / ANGLE_REPORT_HZ)) {
+    last_usb += (1000000UL / ANGLE_REPORT_HZ);
     // Wait a bit after boot before sending USB data to ensure encoder is ready
-    if (first_usb_send && millis() < 500) {
+    if (first_usb_send && now_ms < 500) {
       return; // Skip first 500ms of USB sends
     }
     first_usb_send = false;
-    // Now use real encoder value
-    usb_send_joystick(wheel_angle_rad);
+    // Refresh steering right before USB send so reports don't stall on cached values.
+    encoder_update();
+    float latest_centered_angle = encoder_read_centered_angle_rad();
+    wheel_angle_rad = latest_centered_angle;
+    usb_send_joystick(latest_centered_angle);
   }
 }

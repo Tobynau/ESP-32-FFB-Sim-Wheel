@@ -41,6 +41,7 @@ void MT6701::begin()
         Wire.begin();
     }
     Wire.setClock(400000);
+    Wire.setTimeOut(2);
     xTaskCreatePinnedToCore(updateTask, "MT6701 update task", 2048, this, 2, NULL, 1);
     xSemaphoreTake(rpmFilterMutex, portMAX_DELAY);
     rpmFilter.resize(rpmFilterSize);
