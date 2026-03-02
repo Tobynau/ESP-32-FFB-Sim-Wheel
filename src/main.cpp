@@ -8,6 +8,7 @@
 #include "vesc.h"
 #include "hid.h"
 #include "effects.h"
+#include "pedals.h"
 #include "VescUart.h"
 
 //
@@ -36,9 +37,18 @@ float wheel_angle_rad = 0.0f;
 float wheel_vel_rads = 0.0f;
 static inline uint32_t usec() { return micros(); }
 
-// Button pin for reading a user button (active LOW). Set to 0 to disable.
-const int Left_padle = 0; 
-const int Right_padle = 1; 
+// Paddle shifter pins (active LOW with internal pull-ups)
+const int LEFT_PADDLE_PIN = 4;
+const int RIGHT_PADDLE_PIN = 5;
+
+// Pedals: 2x MT6701 + 1x HX711 loadcell
+const uint8_t CLUTCH_ENCODER_I2C_ADDR = 0x07;
+const uint8_t GAS_ENCODER_I2C_ADDR = 0x08;
+const float CLUTCH_TRAVEL_TURNS = 0.25f;
+const float GAS_TRAVEL_TURNS = 0.25f;
+const int BRAKE_HX711_DOUT_PIN = 11;
+const int BRAKE_HX711_SCK_PIN = 12;
+const int32_t BRAKE_FULLSCALE_COUNTS = 100000;
 
 // Expose configuration to effects and hid modules
 // (declared in effects.h and hid.h)
@@ -58,7 +68,6 @@ const int Right_padle = 1;
 
 void setup() {
   Serial.begin(115200);
-  hid_init();
   
   // Encoder / gearing configuration
   const uint8_t ENCODER_I2C_ADDR = 0x06; // MT6701 default
@@ -69,6 +78,20 @@ void setup() {
   
   // Initialize encoder on I2C pins at CTRL_HZ sampling
   encoder_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, encoder_to_motor_ratio, motor_to_wheel_ratio, MT_UPDATE_MS);
+  pedals_init(
+      I2C_SDA_PIN,
+      I2C_SCL_PIN,
+      CLUTCH_ENCODER_I2C_ADDR,
+      GAS_ENCODER_I2C_ADDR,
+      CLUTCH_TRAVEL_TURNS,
+      GAS_TRAVEL_TURNS,
+      BRAKE_HX711_DOUT_PIN,
+      BRAKE_HX711_SCK_PIN,
+      BRAKE_FULLSCALE_COUNTS);
+
+  left_paddle_pin = LEFT_PADDLE_PIN;
+  right_paddle_pin = RIGHT_PADDLE_PIN;
+  hid_init();
   
   delay(100);
   // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX).
