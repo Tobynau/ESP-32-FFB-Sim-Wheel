@@ -3,6 +3,7 @@
 #include <math.h>
 #include <Arduino.h>
 #include "encoder.h"
+#include "pedals.h"
 
 #include "USB.h"
 #include "USBHID.h"
@@ -24,6 +25,15 @@ static const uint8_t report_descriptor[] = {
       0x26, 0xFF, 0x7F,          // Logical Max (32767)
       0x75, 0x10,
       0x95, 0x01,
+      0x81, 0x02,
+
+      0x09, 0x31,                // Usage (Y) - Clutch
+      0x09, 0x32,                // Usage (Z) - Gas
+      0x09, 0x35,                // Usage (Rz) - Brake
+      0x15, 0x00,                // Logical Min (0)
+      0x26, 0xFF, 0x7F,          // Logical Max (32767)
+      0x75, 0x10,
+      0x95, 0x03,
       0x81, 0x02,
 
       0x05, 0x09,                // Usage Page (Button)
@@ -548,8 +558,9 @@ CustomHIDDevice Device;
 // ----------------------
 // Joystick State
 // ----------------------
-uint8_t axis[3]; // 2 bytes for X, 1 byte for button/padding
-int button_pin = 0; // 0 = unused
+int left_paddle_pin = -1;
+int right_paddle_pin = -1;
+uint8_t axis[9]; // X,Y,Z,Rz = 8 bytes + 1 byte buttons
 
 static bool pid_state_dirty = true;
 static uint8_t pid_state_last_status = 0xFF;
@@ -596,13 +607,28 @@ void usb_send_joystick(float angle_rad) {
     half_range_rad = PI;
   }
   
-  int16_t v = angle_to_hid16(ang, half_range_rad);
-  axis[0] = (uint8_t)(v & 0xFF);
-  axis[1] = (uint8_t)((v >> 8) & 0xFF);
-  axis[2] = 0;
+  int16_t steering = angle_to_hid16(ang, half_range_rad);
 
-  if (button_pin != 0 && digitalRead(button_pin) == LOW) {
-    axis[2] |= 0x01;
+  pedals_update();
+  uint16_t clutch = pedals_get_clutch_hid16();
+  uint16_t gas = pedals_get_gas_hid16();
+  uint16_t brake = pedals_get_brake_hid16();
+
+  axis[0] = (uint8_t)(steering & 0xFF);
+  axis[1] = (uint8_t)((steering >> 8) & 0xFF);
+  axis[2] = (uint8_t)(clutch & 0xFF);
+  axis[3] = (uint8_t)((clutch >> 8) & 0xFF);
+  axis[4] = (uint8_t)(gas & 0xFF);
+  axis[5] = (uint8_t)((gas >> 8) & 0xFF);
+  axis[6] = (uint8_t)(brake & 0xFF);
+  axis[7] = (uint8_t)((brake >> 8) & 0xFF);
+  axis[8] = 0;
+
+  if (left_paddle_pin >= 0 && digitalRead(left_paddle_pin) == LOW) {
+    axis[8] |= 0x01;
+  }
+  if (right_paddle_pin >= 0 && digitalRead(right_paddle_pin) == LOW) {
+    axis[8] |= 0x02;
   }
 
   Device.send(axis, sizeof(axis));
@@ -610,27 +636,19 @@ void usb_send_joystick(float angle_rad) {
 }
 
 void hid_init() {
+  if (left_paddle_pin >= 0) {
+    pinMode(left_paddle_pin, INPUT_PULLUP);
+  }
+  if (right_paddle_pin >= 0) {
+    pinMode(right_paddle_pin, INPUT_PULLUP);
+  }
   USB.begin();
   Device.begin();
 }
 
 void hid_task() {
-  // Remove the HID.ready() check - just always send
   encoder_update();
-  float ang = encoder_read_centered_angle_rad(); // Use centered continuous angle
-  float half_range_rad = (max_wheel_angle_deg * PI / 180.0f) * 0.5f;
-  if (!isfinite(half_range_rad) || half_range_rad <= 0.0f) {
-    half_range_rad = PI;
-  }
-  int16_t v = angle_to_hid16(ang, half_range_rad);
-  axis[0] = (uint8_t)(v & 0xFF);
-  axis[1] = (uint8_t)((v >> 8) & 0xFF);
-  axis[2] = 0;
-
-  if (button_pin != 0 && digitalRead(button_pin) == LOW) axis[2] |= 0x01;
-
-  Device.send(axis, sizeof(axis));
-  send_pid_state_if_needed();
+  usb_send_joystick(encoder_read_centered_angle_rad());
   delay(10);
 }
 
