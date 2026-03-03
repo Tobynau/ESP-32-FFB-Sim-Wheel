@@ -79,4 +79,12 @@ extern float effect_periodic_freq;
 extern float effect_conditional_active;
 extern float effect_conditional_param;
 
+extern float ffb_scale_constant;
+extern float ffb_scale_spring;
+extern float ffb_scale_damper;
+extern float ffb_scale_inertia;
+extern float ffb_scale_friction;
+extern float ffb_scale_periodic;
+extern float ffb_scale_conditional;
+
 #endif // EFFECTS_H

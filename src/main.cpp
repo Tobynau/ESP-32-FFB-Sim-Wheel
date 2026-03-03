@@ -10,6 +10,9 @@
 #include "effects.h"
 #include "pedals.h"
 #include "VescUart.h"
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
 
 //
 // ========== CONFIG ==========
@@ -36,6 +39,9 @@ static float overall_ratio = 25.0f; // encoder turns per wheel turn
 float wheel_angle_rad = 0.0f;
 float wheel_vel_rads = 0.0f;
 static inline uint32_t usec() { return micros(); }
+static volatile float wheel_angle_snapshot_rad = 0.0f;
+static volatile float wheel_vel_snapshot_rads = 0.0f;
+static volatile float overall_strength = 1.0f;
 
 // Paddle shifter pins (active LOW with internal pull-ups)
 const int LEFT_PADDLE_PIN = 4;
@@ -53,6 +59,264 @@ const int GAS_ADC_MAX = 3300;
 const int BRAKE_HX711_DOUT_PIN = 11;
 const int BRAKE_HX711_SCK_PIN = 12;
 const int32_t BRAKE_FULLSCALE_COUNTS = 100000;
+
+static TaskHandle_t ffb_task_handle = nullptr;
+static TaskHandle_t comm_task_handle = nullptr;
+
+static char serial_line_buf[192];
+static size_t serial_line_len = 0;
+
+static bool str_ieq(const char *a, const char *b) {
+  if (!a || !b) return false;
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
+static void serial_send_line(const char *line) {
+  if (!line) return;
+  Serial.print(line);
+  Serial.print("\n");
+}
+
+static void serial_send_config() {
+  char out[384];
+  snprintf(
+      out,
+      sizeof(out),
+      "{\"type\":\"config\",\"max_angle_deg\":%.1f,\"angle_limit_stiffness\":%.2f,\"overall_strength\":%.3f,\"motor_max_amps\":%.2f,\"device_gain\":%.3f,\"scale_constant\":%.3f,\"scale_spring\":%.3f,\"scale_damper\":%.3f,\"scale_inertia\":%.3f,\"scale_friction\":%.3f,\"scale_periodic\":%.3f}",
+      max_wheel_angle_deg,
+      angle_limit_stiffness,
+      (double)overall_strength,
+      vesc_get_max_current(),
+      device_gain,
+      ffb_scale_constant,
+      ffb_scale_spring,
+      ffb_scale_damper,
+      ffb_scale_inertia,
+      ffb_scale_friction,
+      ffb_scale_periodic);
+  serial_send_line(out);
+}
+
+static void serial_send_telemetry() {
+  uint8_t buttons = hid_get_button_bits();
+  float angle = wheel_angle_snapshot_rad;
+  float vel = wheel_vel_snapshot_rads;
+  float cmd_a = vesc_get_last_commanded_current();
+  float mot_a = vesc_get_last_motor_current();
+
+  char out[384];
+  snprintf(
+      out,
+      sizeof(out),
+      "{\"type\":\"telemetry\",\"angle_rad\":%.6f,\"angle_deg\":%.2f,\"vel_rads\":%.4f,\"buttons\":%u,\"left_paddle\":%u,\"right_paddle\":%u,\"current_cmd_a\":%.3f,\"current_motor_a\":%.3f,\"ffb_active\":%u}",
+      angle,
+      angle * 57.2957795f,
+      vel,
+      (unsigned)buttons,
+      (unsigned)((buttons & 0x01) ? 1 : 0),
+      (unsigned)((buttons & 0x02) ? 1 : 0),
+      cmd_a,
+      mot_a,
+      (unsigned)(ffb_has_active_effects() ? 1 : 0));
+  serial_send_line(out);
+}
+
+static float clampf_local(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static bool apply_set_param(const char *key, float value) {
+  if (str_ieq(key, "max_angle_deg")) {
+    max_wheel_angle_deg = clampf_local(value, 180.0f, 2160.0f);
+    return true;
+  }
+  if (str_ieq(key, "angle_limit_stiffness")) {
+    angle_limit_stiffness = clampf_local(value, 0.0f, 2000.0f);
+    return true;
+  }
+  if (str_ieq(key, "overall_strength")) {
+    overall_strength = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "motor_max_amps")) {
+    vesc_set_max_current(value);
+    return true;
+  }
+  if (str_ieq(key, "device_gain")) {
+    device_gain = clampf_local(value, 0.0f, 1.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_constant")) {
+    ffb_scale_constant = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_spring")) {
+    ffb_scale_spring = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_damper")) {
+    ffb_scale_damper = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_inertia")) {
+    ffb_scale_inertia = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_friction")) {
+    ffb_scale_friction = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  if (str_ieq(key, "scale_periodic")) {
+    ffb_scale_periodic = clampf_local(value, 0.0f, 2.0f);
+    return true;
+  }
+  return false;
+}
+
+static void handle_serial_command(char *line) {
+  if (!line) return;
+
+  while (*line == ' ' || *line == '\t') ++line;
+  size_t n = strlen(line);
+  while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n' || line[n - 1] == ' ' || line[n - 1] == '\t')) {
+    line[n - 1] = '\0';
+    n--;
+  }
+  if (n == 0) return;
+
+  if (str_ieq(line, "get")) {
+    serial_send_config();
+    return;
+  }
+  if (str_ieq(line, "recenter")) {
+    encoder_recenter();
+    serial_send_line("{\"type\":\"ok\",\"cmd\":\"recenter\"}");
+    return;
+  }
+  if (str_ieq(line, "ping")) {
+    serial_send_line("{\"type\":\"pong\"}");
+    return;
+  }
+  if (strncasecmp(line, "set ", 4) == 0) {
+    char key[48] = {0};
+    float value = 0.0f;
+    if (sscanf(line + 4, "%47s %f", key, &value) == 2) {
+      if (apply_set_param(key, value)) {
+        serial_send_line("{\"type\":\"ok\",\"cmd\":\"set\"}");
+        serial_send_config();
+      } else {
+        serial_send_line("{\"type\":\"error\",\"message\":\"unknown_key\"}");
+      }
+      return;
+    }
+    serial_send_line("{\"type\":\"error\",\"message\":\"bad_set_syntax\"}");
+    return;
+  }
+
+  serial_send_line("{\"type\":\"error\",\"message\":\"unknown_command\"}");
+}
+
+static void serial_poll_commands() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    char ch = (char)c;
+    if (ch == '\n') {
+      serial_line_buf[serial_line_len] = '\0';
+      handle_serial_command(serial_line_buf);
+      serial_line_len = 0;
+      continue;
+    }
+    if (ch == '\r') continue;
+    if (serial_line_len < (sizeof(serial_line_buf) - 1)) {
+      serial_line_buf[serial_line_len++] = ch;
+    } else {
+      serial_line_len = 0;
+      serial_send_line("{\"type\":\"error\",\"message\":\"line_too_long\"}");
+    }
+  }
+}
+
+static void ffb_task(void *arg) {
+  (void)arg;
+  TickType_t last_wake = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(1);
+  bool vesc_control_active = false;
+
+  for (;;) {
+    vTaskDelayUntil(&last_wake, period);
+
+    encoder_update();
+    float centered_angle = encoder_read_centered_angle_rad();
+    float vel_rads = encoder_read_vel_rads();
+    wheel_angle_rad = centered_angle;
+    wheel_vel_rads = vel_rads;
+    wheel_angle_snapshot_rad = centered_angle;
+    wheel_vel_snapshot_rads = vel_rads;
+
+    float tau = mix_effects(wheel_angle_rad, wheel_vel_rads);
+    float motor_tau = tau / gear_ratio;
+    float amps = motor_tau * TORQUE_TO_CURRENT * overall_strength;
+
+    bool force_demand = fabsf(amps) > 0.02f;
+    bool active_effects = ffb_has_active_effects();
+    bool recent_ffb_activity = (millis() - last_effect_time) < 1500;
+    bool ff_should_control = active_effects || force_demand || recent_ffb_activity;
+
+    if (ff_should_control) {
+      vesc_set_current(amps);
+      vesc_control_active = true;
+    } else if (vesc_control_active) {
+      vesc_set_current(0.0f);
+      vesc_control_active = false;
+    }
+  }
+}
+
+static void comm_task(void *arg) {
+  (void)arg;
+
+  uint32_t boot_ms = millis();
+  uint32_t last_usb_us = usec();
+  uint32_t last_telemetry_ms = 0;
+  uint32_t last_vesc_poll_ms = 0;
+
+  for (;;) {
+    hid_process_reports(8);
+    serial_poll_commands();
+
+    uint32_t now_us = usec();
+    uint32_t now_ms = millis();
+
+    if ((now_us - last_usb_us) >= (1000000UL / ANGLE_REPORT_HZ)) {
+      last_usb_us += (1000000UL / ANGLE_REPORT_HZ);
+      if ((now_ms - boot_ms) >= 500) {
+        usb_send_joystick(wheel_angle_snapshot_rad);
+      }
+    }
+
+    if ((now_ms - last_telemetry_ms) >= 50) {
+      last_telemetry_ms = now_ms;
+      serial_send_telemetry();
+    }
+
+    if ((now_ms - last_vesc_poll_ms) >= 100) {
+      last_vesc_poll_ms = now_ms;
+      vesc_request_status5();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
 
 // Expose configuration to effects and hid modules
 // (declared in effects.h and hid.h)
@@ -107,6 +371,7 @@ void setup() {
   UART.setSerialPort(&Serial1);
 
   device_gain = 1.0f;
+  overall_strength = 1.0f;
   last_effect_time = millis();
 
   // configure button pin and FFB gearing
@@ -116,70 +381,13 @@ void setup() {
   
   // Set gear ratio for FFB calculations (Motor -> Wheel)
   gear_ratio = motor_to_wheel_ratio;
+
+  xTaskCreatePinnedToCore(ffb_task, "ffb_task", 6144, nullptr, 4, &ffb_task_handle, 1);
+  xTaskCreatePinnedToCore(comm_task, "comm_task", 6144, nullptr, 1, &comm_task_handle, 0);
 }
 
 
 
 void loop() {
-  static uint32_t last_ctrl = 0;
-  static uint32_t last_usb = 0;
-  static uint32_t last_telemetry = 0;
-  static bool first_usb_send = true;
-  static bool vesc_control_active = false;
-  uint32_t now_us = usec();
-  uint32_t now_ms = millis();
-  
-  // Poll telemetry sparingly (library call is blocking while waiting for response).
-  // Keep disabled by default so force loop timing and outgoing current commands are not starved.
-#if VESC_ENABLE_TELEMETRY_POLL
-  if ((now_ms - last_telemetry) >= 200) {
-    last_telemetry = now_ms;
-    vesc_request_status5();
-  }
-#endif
-
-  if ((now_us - last_ctrl) >= (1000000UL / CTRL_HZ)) {
-    last_ctrl += (1000000UL / CTRL_HZ);
-  // update potentiometer sampling
-  encoder_update();
-  // Use centered angle (relative to power-on position) for all FFB and game output
-  float centered_angle = encoder_read_centered_angle_rad();
-  float vel_rads = encoder_read_vel_rads();
-  wheel_angle_rad = centered_angle;
-  wheel_vel_rads = vel_rads;
-  
-  float tau = mix_effects(wheel_angle_rad, wheel_vel_rads);
-  // Convert torque at wheel to motor torque using gear ratio
-  float motor_tau = tau / gear_ratio;
-  // Map motor torque to current (simple linear scale, user-calibrate TORQUE_TO_CURRENT)
-  float amps = motor_tau * TORQUE_TO_CURRENT;
-
-  // Take over motor control whenever an effect is active or there is real force demand.
-  // This avoids suppressing valid force commands when host actuator-enable sequencing differs.
-  bool force_demand = fabsf(amps) > 0.02f;
-  bool active_effects = ffb_has_active_effects();
-  bool recent_ffb_activity = (millis() - last_effect_time) < 1500;
-  bool ff_should_control = active_effects || force_demand || recent_ffb_activity;
-  if (ff_should_control) {
-    vesc_set_current(amps);
-    vesc_control_active = true;
-  } else if (vesc_control_active) {
-    // Release motor once when FFB stops, then remain silent.
-    vesc_set_current(0.0f);
-    vesc_control_active = false;
-  }
-  }
-  if ((now_us - last_usb) >= (1000000UL / ANGLE_REPORT_HZ)) {
-    last_usb += (1000000UL / ANGLE_REPORT_HZ);
-    // Wait a bit after boot before sending USB data to ensure encoder is ready
-    if (first_usb_send && now_ms < 500) {
-      return; // Skip first 500ms of USB sends
-    }
-    first_usb_send = false;
-    // Refresh steering right before USB send so reports don't stall on cached values.
-    encoder_update();
-    float latest_centered_angle = encoder_read_centered_angle_rad();
-    wheel_angle_rad = latest_centered_angle;
-    usb_send_joystick(latest_centered_angle);
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }

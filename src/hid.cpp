@@ -2,12 +2,22 @@
 #include "effects.h"
 #include <math.h>
 #include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "encoder.h"
 #include "pedals.h"
 
 #include "USB.h"
 #include "USBHID.h"
 USBHID HID;
+
+struct HidReportMsg {
+  uint8_t report_id;
+  uint8_t len;
+  uint8_t data[32];
+};
+
+static QueueHandle_t hid_report_queue = nullptr;
 
 // ----------------------
 // HID Report Descriptor
@@ -567,6 +577,17 @@ static uint8_t pid_state_last_status = 0xFF;
 static uint8_t pid_state_last_playing = 0xFF;
 static uint32_t pid_state_last_sent_ms = 0;
 
+uint8_t hid_get_button_bits() {
+  uint8_t bits = 0;
+  if (left_paddle_pin >= 0 && digitalRead(left_paddle_pin) == LOW) {
+    bits |= 0x01;
+  }
+  if (right_paddle_pin >= 0 && digitalRead(right_paddle_pin) == LOW) {
+    bits |= 0x02;
+  }
+  return bits;
+}
+
 static inline void fill_pid_state_report(uint8_t *status, uint8_t *playing) {
   uint8_t local_status = 0;
   uint8_t local_playing = effect_playing;
@@ -622,14 +643,7 @@ void usb_send_joystick(float angle_rad) {
   axis[5] = (uint8_t)((gas >> 8) & 0xFF);
   axis[6] = (uint8_t)(brake & 0xFF);
   axis[7] = (uint8_t)((brake >> 8) & 0xFF);
-  axis[8] = 0;
-
-  if (left_paddle_pin >= 0 && digitalRead(left_paddle_pin) == LOW) {
-    axis[8] |= 0x01;
-  }
-  if (right_paddle_pin >= 0 && digitalRead(right_paddle_pin) == LOW) {
-    axis[8] |= 0x02;
-  }
+  axis[8] = hid_get_button_bits();
 
   Device.send(axis, sizeof(axis));
   send_pid_state_if_needed();
@@ -644,12 +658,25 @@ void hid_init() {
   }
   USB.begin();
   Device.begin();
+  if (hid_report_queue == nullptr) {
+    hid_report_queue = xQueueCreate(16, sizeof(HidReportMsg));
+  }
 }
 
 void hid_task() {
   encoder_update();
   usb_send_joystick(encoder_read_centered_angle_rad());
   delay(10);
+}
+
+void hid_process_reports(uint32_t max_reports) {
+  if (hid_report_queue == nullptr) return;
+  HidReportMsg msg;
+  uint32_t handled = 0;
+  while (handled < max_reports && xQueueReceive(hid_report_queue, &msg, 0) == pdTRUE) {
+    handle_ffb_report(msg.report_id, msg.data, msg.len);
+    handled++;
+  }
 }
 
 void hid_notify_pid_state_changed() {
@@ -660,5 +687,18 @@ void hid_notify_pid_state_changed() {
 // Handle FFB Output Reports
 // ----------------------
 void on_hid_set_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
-  handle_ffb_report(report_id, buf, len);
+  if (hid_report_queue == nullptr || buf == nullptr || len == 0) return;
+
+  HidReportMsg msg;
+  msg.report_id = report_id;
+  uint16_t copy_len = len;
+  if (copy_len > sizeof(msg.data)) copy_len = sizeof(msg.data);
+  msg.len = (uint8_t)copy_len;
+  memcpy(msg.data, buf, copy_len);
+
+  if (xQueueSend(hid_report_queue, &msg, 0) != pdTRUE) {
+    HidReportMsg throwaway;
+    (void)xQueueReceive(hid_report_queue, &throwaway, 0);
+    (void)xQueueSend(hid_report_queue, &msg, 0);
+  }
 }

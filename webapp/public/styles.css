@@ -1,0 +1,95 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f172a;
+  --panel: #111827;
+  --panel-alt: #1f2937;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --primary: #3b82f6;
+  --accent: #10b981;
+  --border: #374151;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: linear-gradient(135deg, #0b1222 0%, #111827 100%);
+  color: var(--text);
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.25rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.header h1 { margin: 0 0 0.35rem; }
+.subtitle { margin: 0; color: var(--muted); }
+
+.toolbar {
+  margin-top: 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.status {
+  margin-left: auto;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.4rem 0.6rem;
+  min-width: 140px;
+  text-align: center;
+}
+
+.btn {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.9rem;
+  background: var(--panel-alt);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn.primary { background: var(--primary); border-color: #2563eb; }
+.btn.accent { background: var(--accent); border-color: #059669; }
+
+.card {
+  background: rgba(17, 24, 39, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 1rem;
+  backdrop-filter: blur(4px);
+}
+
+.grid { display: grid; gap: 1rem; }
+.two-col { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.three-col { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+
+.control {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.6rem;
+}
+.control label { color: #cbd5e1; font-weight: 600; }
+.control output { color: #93c5fd; font-variant-numeric: tabular-nums; }
+input[type='range'] { width: 100%; }
+
+.telemetry .stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.6rem;
+}
+.telemetry .stats div {
+  background: #0b1222;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem;
+}
+.telemetry span { display: block; color: var(--muted); font-size: 0.86rem; }
+.telemetry strong { font-size: 1.08rem; font-variant-numeric: tabular-nums; }
