@@ -1,0 +1,12 @@
+{
+  "name": "esp32-ffb-wheel-webapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Web Serial configuration app for ESP32 FFB wheel",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
