@@ -3,6 +3,39 @@
 ## Overview
 The FFB system has been fully implemented with proper torque scaling, effect handling, and angle limiting. The motor receives force commands through the VESC via UART.
 
+## Web App Tuning (Recommended)
+
+This firmware now exposes a **separate USB CDC serial interface** for configuration/telemetry, while games continue to use the **USB HID FFB interface**.
+
+- HID endpoint: game input + FFB effects
+- CDC endpoint: web app config + telemetry
+- These are separate endpoints on a composite USB device (no shared HID channel).
+
+### Start the web app
+
+From the project root:
+
+```bash
+cd webapp
+npm install
+npm start
+```
+
+Open `http://localhost:3000` in a Chromium-based browser, click **Connect**, select the ESP32 serial port, then tune:
+
+- Max angle
+- Recenter button
+- Overall strength
+- Motor max amps
+- Per-effect sliders (constant, spring, damper, inertia, friction, periodic)
+- Live telemetry (steering angle, paddle/button state, command current, motor current)
+
+### Firmware scheduling model
+
+- High-priority task: FFB control loop (`1 kHz`)
+- Low-priority task: USB CDC command parsing + telemetry + VESC polling
+- HID callbacks are non-blocking (reports are queued and processed outside USB callbacks)
+
 ## Important: Power-On Centering
 **The wheel assumes it is centered at whatever position it's in when powered on.** All angle measurements, game output, and FFB effects work relative to this center position:
 - Center position (0°) = where the wheel is at power-on

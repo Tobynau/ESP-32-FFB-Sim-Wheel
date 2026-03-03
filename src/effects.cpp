@@ -32,6 +32,14 @@ float effect_periodic_freq = 1.0f;
 float effect_conditional_active = 0.0f;
 float effect_conditional_param = 0.0f;
 
+float ffb_scale_constant = 1.0f;
+float ffb_scale_spring = 1.0f;
+float ffb_scale_damper = 1.0f;
+float ffb_scale_inertia = 1.0f;
+float ffb_scale_friction = 1.0f;
+float ffb_scale_periodic = 1.0f;
+float ffb_scale_conditional = 1.0f;
+
 // Configuration
 float gear_ratio = 1.0f; // motor:wheel
 float max_wheel_angle_deg = 900.0f; // default 900 degrees lock-to-lock (typical sim wheel)
@@ -113,7 +121,7 @@ static float compute_block_force(EffectBlock *b, float angle, float vel, float a
         case ET_CONSTANT:
             if (ffb_verbose) Serial.printf("FFB: block const mag=%.3f gain=%.3f\n", mag, b->gain);
             // magnitude is -1..1, scale to Nm (reasonable max ~10Nm for sim wheels)
-            return mag * b->gain * 10.0f;
+            return mag * b->gain * 10.0f * ffb_scale_constant;
         case ET_RAMP: {
             float frac = 0.0f;
             if (b->duration_ms > 0) frac = min(1.0f, (now - b->start_time_ms) / (float)b->duration_ms);
@@ -125,23 +133,23 @@ static float compute_block_force(EffectBlock *b, float angle, float vel, float a
             float center = b->param2; // center in radians
             if (ffb_verbose) Serial.printf("FFB: block spring k=%.3f center=%.3f\n", k, center);
             float error = center - angle;
-            return k * error * b->gain;
+            return k * error * b->gain * ffb_scale_spring;
         }
         case ET_DAMPER: {
             float bcoef = b->param1; // damping coefficient in Nm/(rad/s)
             // damper opposes motion
-            return -bcoef * vel * b->gain;
+            return -bcoef * vel * b->gain * ffb_scale_damper;
         }
         case ET_INERTIA: {
             float mass = b->param1; // Moment of Inertia
             // inertia opposes acceleration
-            return -mass * accel * b->gain;
+            return -mass * accel * b->gain * ffb_scale_inertia;
         }
         case ET_FRICTION: {
             float coeff = b->param1 > 0.0f ? b->param1 : (fabsf(mag) * 5.0f); // friction coefficient scaled to Nm
             // friction opposes motion (velocity-independent coulomb friction)
             if (fabsf(vel) < 0.01f) return 0.0f; // deadzone to avoid chatter
-            return -coeff * (vel >= 0 ? 1.0f : -1.0f) * b->gain;
+            return -coeff * (vel >= 0 ? 1.0f : -1.0f) * b->gain * ffb_scale_friction;
         }
         case ET_PERIODIC: {
             float phase = b->phase + 2.0f * M_PI * b->freq_hz * tsec;
@@ -157,12 +165,12 @@ static float compute_block_force(EffectBlock *b, float angle, float vel, float a
             }
             if (ffb_verbose) Serial.printf("FFB: block periodic type=%d freq=%.2f amp=%.3f\n", ptype, b->freq_hz, mag);
             // magnitude scaled to Nm
-            return val * mag * b->gain * 8.0f;
+            return val * mag * b->gain * 8.0f * ffb_scale_periodic;
         }
         case ET_CONDITION: {
             // For a simple condition: use param1 as deadband/threshold modifier
             float threshold = b->param1;
-            if (fabsf(angle - b->direction_rad) < threshold) return mag * b->gain * 8.0f;
+            if (fabsf(angle - b->direction_rad) < threshold) return mag * b->gain * 8.0f * ffb_scale_conditional;
             return 0.0f;
         }
     }
@@ -225,9 +233,9 @@ float mix_effects(float angle, float vel) {
     }
     
     // Legacy effects (backward compatibility) - scaled properly to Nm
-    if (effect_constant_active) tau += effect_constant_nm * 10.0f; // scale to Nm
-    if (effect_spring_active)  tau += effect_spring_k * (effect_spring_center - angle);
-    if (effect_damper_active)  tau += -effect_damper_b * vel;
+    if (effect_constant_active) tau += effect_constant_nm * 10.0f * ffb_scale_constant; // scale to Nm
+    if (effect_spring_active)  tau += effect_spring_k * (effect_spring_center - angle) * ffb_scale_spring;
+    if (effect_damper_active)  tau += -effect_damper_b * vel * ffb_scale_damper;
     if (effect_ramp_active && effect_ramp_duration > 0) {
         unsigned long now = millis();
         float t = (float)(now - effect_ramp_start_time);
@@ -241,11 +249,11 @@ float mix_effects(float angle, float vel) {
     }
 
     if (effect_inertia_active) {
-        tau += -effect_inertia * filtered_accel;
+        tau += -effect_inertia * filtered_accel * ffb_scale_inertia;
     }
     // friction (legacy)
     if (effect_friction_active && fabsf(vel) > 0.01f) {
-        tau += -effect_friction_coeff * 5.0f * (vel >= 0 ? 1.0f : -1.0f); // scale to Nm
+        tau += -effect_friction_coeff * 5.0f * (vel >= 0 ? 1.0f : -1.0f) * ffb_scale_friction; // scale to Nm
     }
     // periodic (legacy)
     if (effect_periodic_active && effect_periodic_amp != 0.0f) {
@@ -258,7 +266,7 @@ float mix_effects(float angle, float vel) {
             case 2: pval = asinf(sinf(phase)) * (2.0f / M_PI); break; // triangle (approx)
             case 3: pval = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break; // saw approx
         }
-        tau += effect_periodic_amp * pval * 8.0f; // scale to Nm
+        tau += effect_periodic_amp * pval * 8.0f * ffb_scale_periodic; // scale to Nm
     }
     
     // Apply device gain
