@@ -41,12 +41,15 @@ static inline uint32_t usec() { return micros(); }
 const int LEFT_PADDLE_PIN = 4;
 const int RIGHT_PADDLE_PIN = 5;
 
-// Pedals: 2x MT6701 + 1x HX711 loadcell
-const bool PEDALS_ENABLED = false; // set true when pedal hardware is connected
-const uint8_t CLUTCH_ENCODER_I2C_ADDR = 0x07;
-const uint8_t GAS_ENCODER_I2C_ADDR = 0x08;
-const float CLUTCH_TRAVEL_TURNS = 0.25f;
-const float GAS_TRAVEL_TURNS = 0.25f;
+// Pedals: 2x analog Hall sensors (clutch/gas) + 1x HX711 load cell (brake)
+const bool PEDALS_ENABLED = true;
+const int CLUTCH_HALL_ADC_PIN = 6;
+const int GAS_HALL_ADC_PIN = 7;
+// 12-bit ADC calibration endpoints (0..4095); adjust after wiring/calibration.
+const int CLUTCH_ADC_MIN = 700;
+const int CLUTCH_ADC_MAX = 3300;
+const int GAS_ADC_MIN = 700;
+const int GAS_ADC_MAX = 3300;
 const int BRAKE_HX711_DOUT_PIN = 11;
 const int BRAKE_HX711_SCK_PIN = 12;
 const int32_t BRAKE_FULLSCALE_COUNTS = 100000;
@@ -81,12 +84,12 @@ void setup() {
   encoder_init(I2C_SDA_PIN, I2C_SCL_PIN, CTRL_HZ, ENCODER_I2C_ADDR, encoder_to_motor_ratio, motor_to_wheel_ratio, MT_UPDATE_MS);
   if (PEDALS_ENABLED) {
     pedals_init(
-        I2C_SDA_PIN,
-        I2C_SCL_PIN,
-        CLUTCH_ENCODER_I2C_ADDR,
-        GAS_ENCODER_I2C_ADDR,
-        CLUTCH_TRAVEL_TURNS,
-        GAS_TRAVEL_TURNS,
+      CLUTCH_HALL_ADC_PIN,
+      GAS_HALL_ADC_PIN,
+      CLUTCH_ADC_MIN,
+      CLUTCH_ADC_MAX,
+      GAS_ADC_MIN,
+      GAS_ADC_MAX,
         BRAKE_HX711_DOUT_PIN,
         BRAKE_HX711_SCK_PIN,
         BRAKE_FULLSCALE_COUNTS);

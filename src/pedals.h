@@ -4,12 +4,12 @@
 #include <Arduino.h>
 
 void pedals_init(
-    int i2c_sda_pin,
-    int i2c_scl_pin,
-    uint8_t clutch_i2c_addr,
-    uint8_t gas_i2c_addr,
-    float clutch_travel_turns,
-    float gas_travel_turns,
+    int clutch_adc_pin,
+    int gas_adc_pin,
+    int clutch_adc_min,
+    int clutch_adc_max,
+    int gas_adc_min,
+    int gas_adc_max,
     int brake_hx711_dout_pin,
     int brake_hx711_sck_pin,
     int32_t brake_fullscale_counts);
