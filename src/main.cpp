@@ -31,7 +31,8 @@ static float overall_ratio = 25.0f; // encoder turns per wheel turn
 // Adjust this based on your motor's torque constant
 #define TORQUE_TO_CURRENT  1.5f
 #define CTRL_HZ     1000UL
-#define ANGLE_REPORT_HZ 500U
+#define ANGLE_REPORT_HZ 100U
+#define VESC_UPDATE_HZ  250U
 #define VESC_UART_BAUD 115200UL
 #define VESC_ENABLE_TELEMETRY_POLL 0
 
@@ -66,6 +67,11 @@ static TaskHandle_t comm_task_handle = nullptr;
 static char serial_line_buf[192];
 static size_t serial_line_len = 0;
 
+// Telemetry streaming: disabled by default, enable with "telemetry on" command.
+// When disabled, no unsolicited CDC traffic is sent, which prevents the USB CDC
+// driver from interfering with HID (they share the same USB device).
+static volatile bool telemetry_streaming = false;
+
 static bool str_ieq(const char *a, const char *b) {
   if (!a || !b) return false;
   while (*a && *b) {
@@ -80,6 +86,13 @@ static bool str_ieq(const char *a, const char *b) {
 
 static void serial_send_line(const char *line) {
   if (!line) return;
+  // Guard: skip entirely when no USB CDC host is connected/reading.
+  // Serial.print() on ESP32-S3 USB CDC can BLOCK when the TX buffer is full,
+  // stalling comm_task and preventing HID reports from being sent, which
+  // causes the host to repeatedly reset the USB device.
+  if (!Serial) return;
+  size_t needed = strlen(line) + 1; // +1 for '\n'
+  if ((size_t)Serial.availableForWrite() < needed) return;
   Serial.print(line);
   Serial.print("\n");
 }
@@ -206,6 +219,16 @@ static void handle_serial_command(char *line) {
     serial_send_line("{\"type\":\"pong\"}");
     return;
   }
+  if (str_ieq(line, "telemetry on")) {
+    telemetry_streaming = true;
+    serial_send_line("{\"type\":\"ok\",\"cmd\":\"telemetry on\"}");
+    return;
+  }
+  if (str_ieq(line, "telemetry off")) {
+    telemetry_streaming = false;
+    serial_send_line("{\"type\":\"ok\",\"cmd\":\"telemetry off\"}");
+    return;
+  }
   if (strncasecmp(line, "set ", 4) == 0) {
     char key[48] = {0};
     float value = 0.0f;
@@ -251,11 +274,15 @@ static void ffb_task(void *arg) {
   TickType_t last_wake = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(1);
   bool vesc_control_active = false;
+  uint32_t last_vesc_write_us = 0;
+  const uint32_t vesc_interval_us = 1000000UL / VESC_UPDATE_HZ;
 
   for (;;) {
     vTaskDelayUntil(&last_wake, period);
 
     encoder_update();
+    // Pedals run on core 1 so HX711 critical sections don't stall core 0 USB.
+    pedals_update();
     float centered_angle = encoder_read_centered_angle_rad();
     float vel_rads = encoder_read_vel_rads();
     wheel_angle_rad = centered_angle;
@@ -272,11 +299,20 @@ static void ffb_task(void *arg) {
     bool recent_ffb_activity = (millis() - last_effect_time) < 1500;
     bool ff_should_control = active_effects || force_demand || recent_ffb_activity;
 
+    // Rate-limit VESC UART writes to VESC_UPDATE_HZ (250Hz) to prevent
+    // saturating the 115200-baud UART and blocking this task.
+    uint32_t now_us = micros();
+    bool vesc_due = (now_us - last_vesc_write_us) >= vesc_interval_us;
+
     if (ff_should_control) {
-      vesc_set_current(amps);
+      if (vesc_due) {
+        vesc_set_current(amps);
+        last_vesc_write_us = now_us;
+      }
       vesc_control_active = true;
     } else if (vesc_control_active) {
       vesc_set_current(0.0f);
+      last_vesc_write_us = now_us;
       vesc_control_active = false;
     }
   }
@@ -288,10 +324,14 @@ static void comm_task(void *arg) {
   uint32_t boot_ms = millis();
   uint32_t last_usb_us = usec();
   uint32_t last_telemetry_ms = 0;
+#if VESC_ENABLE_TELEMETRY_POLL
   uint32_t last_vesc_poll_ms = 0;
+#endif
 
   for (;;) {
-    hid_process_reports(8);
+    // Process as many queued FFB reports as available each cycle to
+    // minimise latency between host effect updates and motor output.
+    hid_process_reports(32);
     serial_poll_commands();
 
     uint32_t now_us = usec();
@@ -304,15 +344,21 @@ static void comm_task(void *arg) {
       }
     }
 
-    if ((now_ms - last_telemetry_ms) >= 50) {
+    // PID state every cycle — it self-throttles internally (20ms cadence)
+    // and is non-blocking (timeout=0), so it won't stall the loop.
+    send_pid_state_if_needed();
+
+    if (telemetry_streaming && (now_ms - last_telemetry_ms) >= 50) {
       last_telemetry_ms = now_ms;
       serial_send_telemetry();
     }
 
+#if VESC_ENABLE_TELEMETRY_POLL
     if ((now_ms - last_vesc_poll_ms) >= 100) {
       last_vesc_poll_ms = now_ms;
       vesc_request_status5();
     }
+#endif
 
     vTaskDelay(pdMS_TO_TICKS(1));
   }
@@ -336,6 +382,9 @@ static void comm_task(void *arg) {
 
 void setup() {
   Serial.begin(115200);
+  // Make USB CDC writes non-blocking: drop data rather than blocking the task
+  // when no host is reading. This prevents HID stalls caused by a full CDC TX buffer.
+  Serial.setTxTimeoutMs(0);
   
   // Encoder / gearing configuration
   const uint8_t ENCODER_I2C_ADDR = 0x06; // MT6701 default
@@ -365,7 +414,8 @@ void setup() {
   
   delay(100);
   // Initialize hardware UART for VESC on GPIO 15 (RX) and 16 (TX).
-  // Keep default at 115200 for maximum compatibility with VESC UART app defaults.
+  // Increase TX buffer before begin() to reduce blocking during setCurrent().
+  Serial1.setTxBufferSize(256);
   Serial1.begin(VESC_UART_BAUD, SERIAL_8N1, 15, 16);
   // Attach VescUart to Serial1
   UART.setSerialPort(&Serial1);
@@ -382,8 +432,10 @@ void setup() {
   // Set gear ratio for FFB calculations (Motor -> Wheel)
   gear_ratio = motor_to_wheel_ratio;
 
-  xTaskCreatePinnedToCore(ffb_task, "ffb_task", 6144, nullptr, 4, &ffb_task_handle, 1);
-  xTaskCreatePinnedToCore(comm_task, "comm_task", 6144, nullptr, 1, &comm_task_handle, 0);
+  xTaskCreatePinnedToCore(ffb_task, "ffb_task", 8192, nullptr, 4, &ffb_task_handle, 1);
+  // comm_task at priority 3: must be above default (1) but below the TinyUSB
+  // daemon task (~24) so USB protocol handling is never starved.
+  xTaskCreatePinnedToCore(comm_task, "comm_task", 8192, nullptr, 3, &comm_task_handle, 0);
 }
 
 

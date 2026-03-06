@@ -89,11 +89,18 @@ async function connectSerial() {
   setStatus('Connected');
 
   startReadLoop();
+  // Enable telemetry streaming on the device (disabled by default to avoid
+  // unsolicited CDC traffic that can interfere with USB HID during gameplay).
+  await sendLine('telemetry on');
   await requestConfig();
 }
 
 async function disconnectSerial() {
   readLoopRunning = false;
+
+  // Disable telemetry streaming before closing so the device stops sending
+  // CDC data and goes back to pure HID mode.
+  try { if (writer) await sendLine('telemetry off'); } catch (_) {}
 
   if (reader) {
     try { await reader.cancel(); } catch (_) {}
