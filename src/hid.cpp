@@ -559,7 +559,7 @@ public:
   }
 
   bool send(uint8_t *value, uint16_t len) {
-    return HID.SendReport(1, value, len); // input report ID 1 (steering/buttons)
+    return HID.SendReport(1, value, len, 0); // non-blocking: dropped frames at 100Hz are invisible
   }
 };
 
@@ -598,21 +598,24 @@ static inline void fill_pid_state_report(uint8_t *status, uint8_t *playing) {
   if (playing) *playing = local_playing;
 }
 
-static void send_pid_state_if_needed() {
+void send_pid_state_if_needed() {
   uint8_t status = 0;
   uint8_t playing = 0;
   fill_pid_state_report(&status, &playing);
 
   uint32_t now = millis();
   bool changed = (status != pid_state_last_status) || (playing != pid_state_last_playing);
-  bool periodic = (now - pid_state_last_sent_ms) >= 100;
+  bool periodic = (now - pid_state_last_sent_ms) >= 20; // Retry frequently since sends are non-blocking
 
   if (!(pid_state_dirty || changed || periodic)) {
     return;
   }
 
   uint8_t payload[2] = {status, playing};
-  HID.SendReport(2, payload, sizeof(payload));
+  // Non-blocking: drop rather than stall comm_task. The single HID IN
+  // endpoint is shared with the joystick report; blocking here stalls
+  // FFB report processing and can cascade into a USB reset.
+  HID.SendReport(2, payload, sizeof(payload), 0);
 
   pid_state_last_status = status;
   pid_state_last_playing = playing;
@@ -630,7 +633,8 @@ void usb_send_joystick(float angle_rad) {
   
   int16_t steering = angle_to_hid16(ang, half_range_rad);
 
-  pedals_update();
+  // pedals_update() is called from ffb_task (core 1) to avoid HX711 bit-bang
+  // interrupt-disabling from stalling the USB interrupt handler (core 0).
   uint16_t clutch = pedals_get_clutch_hid16();
   uint16_t gas = pedals_get_gas_hid16();
   uint16_t brake = pedals_get_brake_hid16();
@@ -646,7 +650,8 @@ void usb_send_joystick(float angle_rad) {
   axis[8] = hid_get_button_bits();
 
   Device.send(axis, sizeof(axis));
-  send_pid_state_if_needed();
+  // PID state is sent separately from comm_task at its own cadence to avoid
+  // colliding with the joystick report on the shared HID IN endpoint.
 }
 
 void hid_init() {
@@ -659,7 +664,7 @@ void hid_init() {
   USB.begin();
   Device.begin();
   if (hid_report_queue == nullptr) {
-    hid_report_queue = xQueueCreate(16, sizeof(HidReportMsg));
+    hid_report_queue = xQueueCreate(64, sizeof(HidReportMsg));
   }
 }
 

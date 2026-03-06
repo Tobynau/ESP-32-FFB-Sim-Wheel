@@ -137,10 +137,17 @@ void pedals_update() {
     }
 
     if (brake_initialized && brake_loadcell.is_ready()) {
-        int32_t raw = brake_loadcell.read();
-        int32_t delta = raw - brake_zero_counts;
-        float norm = (float)delta / (float)brake_fullscale_counts;
-        brake_hid = unit_to_hid16(norm);
+        // Use wait_ready_timeout with a short timeout instead of read(),
+        // because read() internally calls wait_ready() which is an infinite
+        // loop. If the HX711 becomes not-ready between is_ready() and read(),
+        // it can block the ffb_task for hundreds of ms — stalling encoder
+        // updates and VESC commands.
+        if (brake_loadcell.wait_ready_timeout(1)) {
+            int32_t raw = brake_loadcell.read();
+            int32_t delta = raw - brake_zero_counts;
+            float norm = (float)delta / (float)brake_fullscale_counts;
+            brake_hid = unit_to_hid16(norm);
+        }
     } else {
         brake_hid = 0;
     }
