@@ -21,9 +21,6 @@ float encoder_read_angle_rad();
 // Read angle relative to center/power-on position (continuous radians, 0=center)
 float encoder_read_centered_angle_rad();
 
-// Set the current wheel position as the new center (zero) angle.
-void encoder_recenter();
-
 // Read current angular velocity in rad/s (simple derivative, filtered)
 float encoder_read_vel_rads();
 

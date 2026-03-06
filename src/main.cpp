@@ -10,9 +10,6 @@
 #include "effects.h"
 #include "pedals.h"
 #include "VescUart.h"
-#include <string.h>
-#include <strings.h>
-#include <ctype.h>
 
 //
 // ========== CONFIG ==========
@@ -42,7 +39,6 @@ float wheel_vel_rads = 0.0f;
 static inline uint32_t usec() { return micros(); }
 static volatile float wheel_angle_snapshot_rad = 0.0f;
 static volatile float wheel_vel_snapshot_rads = 0.0f;
-static volatile float overall_strength = 1.0f;
 
 // Paddle shifter pins (active LOW with internal pull-ups)
 const int LEFT_PADDLE_PIN = 4;
@@ -63,211 +59,6 @@ const int32_t BRAKE_FULLSCALE_COUNTS = 100000;
 
 static TaskHandle_t ffb_task_handle = nullptr;
 static TaskHandle_t comm_task_handle = nullptr;
-
-static char serial_line_buf[192];
-static size_t serial_line_len = 0;
-
-// Telemetry streaming: disabled by default, enable with "telemetry on" command.
-// When disabled, no unsolicited CDC traffic is sent, which prevents the USB CDC
-// driver from interfering with HID (they share the same USB device).
-static volatile bool telemetry_streaming = false;
-
-static bool str_ieq(const char *a, const char *b) {
-  if (!a || !b) return false;
-  while (*a && *b) {
-    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
-      return false;
-    }
-    ++a;
-    ++b;
-  }
-  return *a == '\0' && *b == '\0';
-}
-
-static void serial_send_line(const char *line) {
-  if (!line) return;
-  // Guard: skip entirely when no USB CDC host is connected/reading.
-  // Serial.print() on ESP32-S3 USB CDC can BLOCK when the TX buffer is full,
-  // stalling comm_task and preventing HID reports from being sent, which
-  // causes the host to repeatedly reset the USB device.
-  if (!Serial) return;
-  size_t needed = strlen(line) + 1; // +1 for '\n'
-  if ((size_t)Serial.availableForWrite() < needed) return;
-  Serial.print(line);
-  Serial.print("\n");
-}
-
-static void serial_send_config() {
-  char out[384];
-  snprintf(
-      out,
-      sizeof(out),
-      "{\"type\":\"config\",\"max_angle_deg\":%.1f,\"angle_limit_stiffness\":%.2f,\"overall_strength\":%.3f,\"motor_max_amps\":%.2f,\"device_gain\":%.3f,\"scale_constant\":%.3f,\"scale_spring\":%.3f,\"scale_damper\":%.3f,\"scale_inertia\":%.3f,\"scale_friction\":%.3f,\"scale_periodic\":%.3f}",
-      max_wheel_angle_deg,
-      angle_limit_stiffness,
-      (double)overall_strength,
-      vesc_get_max_current(),
-      device_gain,
-      ffb_scale_constant,
-      ffb_scale_spring,
-      ffb_scale_damper,
-      ffb_scale_inertia,
-      ffb_scale_friction,
-      ffb_scale_periodic);
-  serial_send_line(out);
-}
-
-static void serial_send_telemetry() {
-  uint8_t buttons = hid_get_button_bits();
-  float angle = wheel_angle_snapshot_rad;
-  float vel = wheel_vel_snapshot_rads;
-  float cmd_a = vesc_get_last_commanded_current();
-  float mot_a = vesc_get_last_motor_current();
-
-  char out[384];
-  snprintf(
-      out,
-      sizeof(out),
-      "{\"type\":\"telemetry\",\"angle_rad\":%.6f,\"angle_deg\":%.2f,\"vel_rads\":%.4f,\"buttons\":%u,\"left_paddle\":%u,\"right_paddle\":%u,\"current_cmd_a\":%.3f,\"current_motor_a\":%.3f,\"ffb_active\":%u}",
-      angle,
-      angle * 57.2957795f,
-      vel,
-      (unsigned)buttons,
-      (unsigned)((buttons & 0x01) ? 1 : 0),
-      (unsigned)((buttons & 0x02) ? 1 : 0),
-      cmd_a,
-      mot_a,
-      (unsigned)(ffb_has_active_effects() ? 1 : 0));
-  serial_send_line(out);
-}
-
-static float clampf_local(float v, float lo, float hi) {
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
-
-static bool apply_set_param(const char *key, float value) {
-  if (str_ieq(key, "max_angle_deg")) {
-    max_wheel_angle_deg = clampf_local(value, 180.0f, 2160.0f);
-    return true;
-  }
-  if (str_ieq(key, "angle_limit_stiffness")) {
-    angle_limit_stiffness = clampf_local(value, 0.0f, 2000.0f);
-    return true;
-  }
-  if (str_ieq(key, "overall_strength")) {
-    overall_strength = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "motor_max_amps")) {
-    vesc_set_max_current(value);
-    return true;
-  }
-  if (str_ieq(key, "device_gain")) {
-    device_gain = clampf_local(value, 0.0f, 1.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_constant")) {
-    ffb_scale_constant = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_spring")) {
-    ffb_scale_spring = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_damper")) {
-    ffb_scale_damper = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_inertia")) {
-    ffb_scale_inertia = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_friction")) {
-    ffb_scale_friction = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  if (str_ieq(key, "scale_periodic")) {
-    ffb_scale_periodic = clampf_local(value, 0.0f, 2.0f);
-    return true;
-  }
-  return false;
-}
-
-static void handle_serial_command(char *line) {
-  if (!line) return;
-
-  while (*line == ' ' || *line == '\t') ++line;
-  size_t n = strlen(line);
-  while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n' || line[n - 1] == ' ' || line[n - 1] == '\t')) {
-    line[n - 1] = '\0';
-    n--;
-  }
-  if (n == 0) return;
-
-  if (str_ieq(line, "get")) {
-    serial_send_config();
-    return;
-  }
-  if (str_ieq(line, "recenter")) {
-    encoder_recenter();
-    serial_send_line("{\"type\":\"ok\",\"cmd\":\"recenter\"}");
-    return;
-  }
-  if (str_ieq(line, "ping")) {
-    serial_send_line("{\"type\":\"pong\"}");
-    return;
-  }
-  if (str_ieq(line, "telemetry on")) {
-    telemetry_streaming = true;
-    serial_send_line("{\"type\":\"ok\",\"cmd\":\"telemetry on\"}");
-    return;
-  }
-  if (str_ieq(line, "telemetry off")) {
-    telemetry_streaming = false;
-    serial_send_line("{\"type\":\"ok\",\"cmd\":\"telemetry off\"}");
-    return;
-  }
-  if (strncasecmp(line, "set ", 4) == 0) {
-    char key[48] = {0};
-    float value = 0.0f;
-    if (sscanf(line + 4, "%47s %f", key, &value) == 2) {
-      if (apply_set_param(key, value)) {
-        serial_send_line("{\"type\":\"ok\",\"cmd\":\"set\"}");
-        serial_send_config();
-      } else {
-        serial_send_line("{\"type\":\"error\",\"message\":\"unknown_key\"}");
-      }
-      return;
-    }
-    serial_send_line("{\"type\":\"error\",\"message\":\"bad_set_syntax\"}");
-    return;
-  }
-
-  serial_send_line("{\"type\":\"error\",\"message\":\"unknown_command\"}");
-}
-
-static void serial_poll_commands() {
-  while (Serial.available() > 0) {
-    int c = Serial.read();
-    if (c < 0) break;
-    char ch = (char)c;
-    if (ch == '\n') {
-      serial_line_buf[serial_line_len] = '\0';
-      handle_serial_command(serial_line_buf);
-      serial_line_len = 0;
-      continue;
-    }
-    if (ch == '\r') continue;
-    if (serial_line_len < (sizeof(serial_line_buf) - 1)) {
-      serial_line_buf[serial_line_len++] = ch;
-    } else {
-      serial_line_len = 0;
-      serial_send_line("{\"type\":\"error\",\"message\":\"line_too_long\"}");
-    }
-  }
-}
 
 static void ffb_task(void *arg) {
   (void)arg;
@@ -292,7 +83,7 @@ static void ffb_task(void *arg) {
 
     float tau = mix_effects(wheel_angle_rad, wheel_vel_rads);
     float motor_tau = tau / gear_ratio;
-    float amps = motor_tau * TORQUE_TO_CURRENT * overall_strength;
+    float amps = motor_tau * TORQUE_TO_CURRENT;
 
     bool force_demand = fabsf(amps) > 0.02f;
     bool active_effects = ffb_has_active_effects();
@@ -323,7 +114,6 @@ static void comm_task(void *arg) {
 
   uint32_t boot_ms = millis();
   uint32_t last_usb_us = usec();
-  uint32_t last_telemetry_ms = 0;
 #if VESC_ENABLE_TELEMETRY_POLL
   uint32_t last_vesc_poll_ms = 0;
 #endif
@@ -332,7 +122,6 @@ static void comm_task(void *arg) {
     // Process as many queued FFB reports as available each cycle to
     // minimise latency between host effect updates and motor output.
     hid_process_reports(32);
-    serial_poll_commands();
 
     uint32_t now_us = usec();
     uint32_t now_ms = millis();
@@ -347,11 +136,6 @@ static void comm_task(void *arg) {
     // PID state every cycle — it self-throttles internally (20ms cadence)
     // and is non-blocking (timeout=0), so it won't stall the loop.
     send_pid_state_if_needed();
-
-    if (telemetry_streaming && (now_ms - last_telemetry_ms) >= 50) {
-      last_telemetry_ms = now_ms;
-      serial_send_telemetry();
-    }
 
 #if VESC_ENABLE_TELEMETRY_POLL
     if ((now_ms - last_vesc_poll_ms) >= 100) {
@@ -381,11 +165,6 @@ static void comm_task(void *arg) {
 // ========== CONTROL LOOP ==========
 
 void setup() {
-  Serial.begin(115200);
-  // Make USB CDC writes non-blocking: drop data rather than blocking the task
-  // when no host is reading. This prevents HID stalls caused by a full CDC TX buffer.
-  Serial.setTxTimeoutMs(0);
-  
   // Encoder / gearing configuration
   const uint8_t ENCODER_I2C_ADDR = 0x06; // MT6701 default
   const int MT_UPDATE_MS = 2; // MT6701 internal update interval (ms) - faster polling for high speed
@@ -421,7 +200,6 @@ void setup() {
   UART.setSerialPort(&Serial1);
 
   device_gain = 1.0f;
-  overall_strength = 1.0f;
   last_effect_time = millis();
 
   // configure button pin and FFB gearing
