@@ -157,6 +157,11 @@ float encoder_read_centered_angle_rad() {
     return centered;
 }
 
+void encoder_recenter() {
+    if (!initialized) return;
+    center_angle_continuous = angle_continuous;
+}
+
 float encoder_read_vel_rads() {
     return vel;
 }
