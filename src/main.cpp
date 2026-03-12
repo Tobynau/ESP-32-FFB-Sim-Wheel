@@ -28,9 +28,9 @@ static float overall_ratio = 25.0f; // encoder turns per wheel turn
 // Adjust this based on your motor's torque constant
 #define TORQUE_TO_CURRENT  1.5f
 #define CTRL_HZ     1000UL
-#define ANGLE_REPORT_HZ 100U
-#define VESC_UPDATE_HZ  250U
-#define VESC_UART_BAUD 115200UL
+#define ANGLE_REPORT_HZ 500U
+#define VESC_UPDATE_HZ  1000U
+#define VESC_UART_BAUD 921600UL
 #define VESC_ENABLE_TELEMETRY_POLL 0
 
 
