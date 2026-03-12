@@ -1,16 +1,12 @@
 # ESP32 FFB Wheel Web App
 
-Local browser-based tuning app for the ESP32 FFB wheel using Web Serial.
+Browser-based tuning app for the ESP32 FFB wheel using Web Serial, hosted on GitHub Pages.
 
-## Run
+## Access
 
-```bash
-cd webapp
-npm install
-npm start
-```
+Hosted at: `https://<username>.github.io/ESP-32-FFB-Sim-Wheel/`
 
-Open http://localhost:3000 in a Chromium-based browser.
+Open in a Chromium-based browser (Chrome, Edge) — Web Serial API is required.
 
 ## Why this design
 
