@@ -3,88 +3,87 @@
 
 #include <Arduino.h>
 
-float mix_effects(float angle, float vel);
-bool ffb_has_active_effects();
-// Handle an incoming HID FFB report (report id + raw buffer)
-void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len);
-// Fill PID feature report payload for the requested report ID.
-uint16_t ffb_get_feature_report(uint8_t report_id, uint8_t *buffer, uint16_t len);
-
-// Effect block types (USB HID PID spec mapping)
+// Internal effect types (mapped from the USB HID PID effect type list)
 enum EffectType {
-	ET_NONE = 0,
-	ET_CONSTANT = 1,      // USB PID: 0x26 (Constant Force)
-	ET_RAMP = 2,          // USB PID: 0x27 (Ramp)
-	ET_SPRING = 3,        // USB PID: 0x40 (Spring)
-	ET_DAMPER = 4,        // USB PID: 0x41 (Damper)
-	ET_INERTIA = 5,       // USB PID: 0x42 (Inertia)
-	ET_FRICTION = 6,      // USB PID: 0x43 (Friction)
-	ET_PERIODIC = 7,      // USB PID: 0x30-0x34 (Sine, Square, Triangle, Saw)
-	ET_CONDITION = 8      // Generic condition-based effect
+    ET_NONE = 0,
+    ET_CONSTANT,   // PID 0x26
+    ET_RAMP,       // PID 0x27
+    ET_SPRING,     // PID 0x40
+    ET_DAMPER,     // PID 0x41
+    ET_INERTIA,    // PID 0x42
+    ET_FRICTION,   // PID 0x43
+    ET_PERIODIC    // PID 0x30..0x34
 };
 
-// Small effect block structure used by the firmware
+// Periodic waveforms
+enum WaveType {
+    WAVE_SINE = 0,
+    WAVE_SQUARE,
+    WAVE_TRIANGLE,
+    WAVE_SAW_UP,
+    WAVE_SAW_DOWN
+};
+
 struct EffectBlock {
-	uint8_t in_use;
-	uint8_t type; // EffectType
-	bool active;
-	uint32_t start_time_ms;
-	uint32_t duration_ms; // 0 = infinite
-	float magnitude; // -1..1
-	float magnitude_end; // for ramp
-	float direction_rad; // direction in radians
-	float freq_hz; // for periodic
-	float phase; // periodic phase
-	float gain; // 0..1
-	// condition params (spring/damper offsets etc)
-	float param1;
-	float param2;
+    uint8_t in_use;
+    uint8_t type;            // EffectType
+    uint8_t wave;            // WaveType (periodic only)
+    bool active;
+    bool direction_enable;
+
+    uint32_t start_time_ms;  // effects-clock time playback started
+    uint32_t duration_ms;    // 0 = infinite
+    uint32_t start_delay_ms;
+    uint8_t loop_count;      // remaining plays; 0xFF = infinite
+
+    float magnitude;         // -1..1 (constant force, periodic amplitude, ramp start)
+    float magnitude_end;     // -1..1 (ramp end)
+    float offset;            // -1..1 (periodic DC offset)
+    float direction_rad;     // 0..2PI, PID convention (0=north, 90deg=+X)
+    float freq_hz;           // periodic frequency
+    float phase0;            // periodic initial phase (rad)
+    float phase_acc;         // integrated phase (rad), advanced at CTRL rate
+    float gain;              // 0..1 per-effect gain from Set Effect
+
+    // Envelope (0 times = no envelope)
+    float attack_level;      // 0..1
+    float fade_level;        // 0..1
+    uint32_t attack_time_ms;
+    uint32_t fade_time_ms;
+
+    // Condition parameters, normalized per the PID spec
+    float cp_offset;         // -1..1 of the metric full-scale
+    float pos_coeff;         // -1..1
+    float neg_coeff;         // -1..1
+    float pos_sat;           // 0..1
+    float neg_sat;           // 0..1
+    float deadband;          // 0..1
 };
 
-// Max concurrent effect blocks to track
 #define MAX_EFFECT_BLOCKS 16
 
-// Enable verbose FFB debug printing when true (disabled to avoid USB conflicts)
+// One-time init (creates the block mutex). Call from setup() before tasks start.
+void effects_init();
+
+// Full torque pipeline, called at CTRL_HZ from the FFB task.
+// Returns commanded rim torque in Nm (already gated, clipped, slew-limited).
+float effects_compute_torque(float angle_rad, float vel_rads, float dt_s);
+
+bool ffb_has_active_effects();
+uint32_t effects_last_host_ms();   // millis() of last FFB report from host
+void effects_all_stop();           // stop playback of every effect (USB suspend, safety)
+
+// HID plumbing
+void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len);
+uint16_t ffb_get_feature_report(uint8_t report_id, uint8_t *buffer, uint16_t len);
+
+// Telemetry helpers
+uint8_t effects_get_status_flags();       // bit0 actuators, bit1 paused, bit2 usb, bit3 faded
+uint8_t effects_get_active_block_count();
+
 extern bool ffb_verbose;
-
-
-// Configuration: gearing and max wheel angle
-extern float gear_ratio; // motor:wheel ratio for torque calculation (e.g. 5 means motor turns 5x for 1 wheel turn)
-extern float max_wheel_angle_deg; // maximum wheel rotation in degrees (e.g. 270 for typical racing wheel)
-extern float angle_limit_stiffness; // spring stiffness for angle limiting (Nm/rad)
-
 extern float device_gain;
-extern unsigned long last_effect_time;
-extern bool effect_constant_active;
-extern float effect_constant_nm;
-extern bool effect_spring_active;
-extern float effect_spring_k;
-extern float effect_spring_center;
-extern bool effect_damper_active;
-extern float effect_damper_b;
-extern bool effect_ramp_active;
-extern float effect_ramp_start;
-extern float effect_ramp_end;
-extern float effect_ramp_duration;
-extern unsigned long effect_ramp_start_time;
-extern bool effect_inertia_active;
-extern float effect_inertia;
-// Friction / Periodic / Conditional effects (simple representations)
-extern bool effect_friction_active;
-extern float effect_friction_coeff;
-extern bool effect_periodic_active;
-extern int effect_periodic_type; // 0=sine,1=square,2=triangle,3=saw
-extern float effect_periodic_amp;
-extern float effect_periodic_freq;
-extern float effect_conditional_active;
-extern float effect_conditional_param;
-
-extern float ffb_scale_constant;
-extern float ffb_scale_spring;
-extern float ffb_scale_damper;
-extern float ffb_scale_inertia;
-extern float ffb_scale_friction;
-extern float ffb_scale_periodic;
-extern float ffb_scale_conditional;
+extern bool device_paused;
+extern volatile float g_ffb_torque_nm;    // last commanded rim torque (for telemetry)
 
 #endif // EFFECTS_H

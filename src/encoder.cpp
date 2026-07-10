@@ -17,6 +17,9 @@ static float angle = 0.0f; // wheel angle in radians (wrapped absolute 0..2PI)
 static float angle_continuous = 0.0f; // wheel angle in radians (continuous, unbounded)
 static float center_angle_continuous = 0.0f; // center position at power-on (continuous radians)
 static float vel = 0.0f;   // wheel angular velocity rad/s
+// Alpha-beta tracker state: smooths velocity without the phase lag and
+// quantization grit of a plain IIR on raw deltas.
+static float ab_angle = 0.0f;
 static bool initialized = false;
 // gearing: encoder -> motor -> wheel
 static float encoder_to_motor_ratio = 1.0f;
@@ -86,6 +89,7 @@ void encoder_init(int sda_pin, int scl_pin, unsigned long sample_hz, uint8_t i2c
     }
 
     vel = 0.0f;
+    ab_angle = angle_continuous;
     last_sample_us = micros();
     initialized = true;
 }
@@ -126,12 +130,23 @@ bool encoder_update() {
     if (dt <= 0.0f) return false;
 
     float wheel_delta_turns = delta_turns / overall_ratio;
-    float new_vel = (wheel_delta_turns * 2.0f * PI) / dt;
-
-    const float alpha = 0.1f;
-    vel = (alpha * new_vel) + (1.0f - alpha) * vel;
 
     angle_continuous += wheel_delta_turns * 2.0f * PI;
+
+    // Alpha-beta tracking filter on the continuous angle. Gives velocity
+    // clean out to ~50Hz at 1kHz sampling, which dampers need to feel smooth
+    // instead of gritty.
+    const float ab_alpha = 0.25f;
+    const float ab_beta = 0.02f;
+    ab_angle += vel * dt;
+    float residual = angle_continuous - ab_angle;
+    if (fabsf(residual) > 0.5f) {
+        // Large jump (missed samples / re-center): snap instead of slewing.
+        ab_angle = angle_continuous;
+        residual = 0.0f;
+    }
+    ab_angle += ab_alpha * residual;
+    vel += (ab_beta / dt) * residual;
     angle = fmodf(angle_continuous, 2.0f * PI);
     if (angle < 0) angle += 2.0f * PI;
 
@@ -157,11 +172,15 @@ float encoder_read_centered_angle_rad() {
     return centered;
 }
 
-void encoder_recenter() {
-    if (!initialized) return;
-    center_angle_continuous = angle_continuous;
-}
-
 float encoder_read_vel_rads() {
     return vel;
+}
+
+// Mark the current physical position as center (0). Triggered by the config
+// tool or by holding both paddles for 3s. The MT6701 is absolute only within
+// one encoder turn (1/overall_ratio of a wheel turn), so center is per-boot
+// state and is intentionally not persisted.
+void encoder_set_center() {
+    if (!initialized) return;
+    center_angle_continuous = angle_continuous;
 }

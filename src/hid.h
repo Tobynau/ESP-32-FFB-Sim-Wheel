@@ -8,9 +8,14 @@ extern USBHID HID;
 
 void usb_send_joystick(float angle_rad);
 void hid_init();
-void hid_task();
 void hid_process_reports(uint32_t max_reports);
 uint8_t hid_get_button_bits();
+
+// Debounce buttons + paddle-combo center calibration. Call at CTRL rate.
+void hid_update_buttons(uint32_t now_ms);
+
+// True while the USB host is present and not suspended.
+bool hid_usb_active();
 
 // Called by USB stack when a Set_Report/Output/Feature arrives
 void on_hid_set_report(uint8_t report_id, uint8_t *buf, uint16_t len);

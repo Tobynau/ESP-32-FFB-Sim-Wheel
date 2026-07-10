@@ -1,4 +1,5 @@
 #include "pedals.h"
+#include "config.h"
 
 #include <math.h>
 #include <HX711.h>
@@ -17,12 +18,28 @@ static int gas_max_adc = 4095;
 
 static int32_t brake_zero_counts = 0;
 static int32_t brake_fullscale_counts = 100000;
+static float ema_alpha = 0.4f;
+static float brake_gamma = 1.0f;
+
+// Filtered normalized positions (0..1)
+static float clutch_f = 0.0f;
+static float gas_f = 0.0f;
+static float brake_f = 0.0f;
 
 static uint16_t clutch_hid = 0;
 static uint16_t gas_hid = 0;
 static uint16_t brake_hid = 0;
 
+// Raw values for the calibration UI
+static uint16_t clutch_raw = 0;
+static uint16_t gas_raw = 0;
+static int32_t brake_raw_delta = 0;
+
 static uint32_t last_update_ms = 0;
+
+// Endpoint margin: the top/bottom 2% of calibrated travel maps to exactly
+// 0 / max so games reliably see fully-released and fully-pressed.
+static constexpr float END_MARGIN = 0.02f;
 
 static inline float clamp01(float v) {
     if (v < 0.0f) return 0.0f;
@@ -40,6 +57,8 @@ static inline float normalize_adc(int raw, int min_adc, int max_adc) {
     int range = max_adc - min_adc;
     if (range == 0) return 0.0f;
     float norm = (float)(raw - min_adc) / (float)range;
+    // Rescale so the endpoint margins clip to 0 and 1.
+    norm = (norm - END_MARGIN) / (1.0f - 2.0f * END_MARGIN);
     return clamp01(norm);
 }
 
@@ -51,48 +70,45 @@ static inline uint16_t unit_to_hid16(float v) {
     return (uint16_t)scaled;
 }
 
+void pedals_apply_config() {
+    int cmin = clamp_adc(g_cfg.clutch_adc_min);
+    int cmax = clamp_adc(g_cfg.clutch_adc_max);
+    int gmin = clamp_adc(g_cfg.gas_adc_min);
+    int gmax = clamp_adc(g_cfg.gas_adc_max);
+    if (cmax < cmin) { int t = cmin; cmin = cmax; cmax = t; }
+    if (gmax < gmin) { int t = gmin; gmin = gmax; gmax = t; }
+    clutch_min_adc = cmin;
+    clutch_max_adc = cmax;
+    gas_min_adc = gmin;
+    gas_max_adc = gmax;
+
+    brake_fullscale_counts = (int32_t)g_cfg.brake_fullscale_counts;
+    if (brake_fullscale_counts < 1000) brake_fullscale_counts = 1000;
+
+    // EMA per 2ms sample; level 0 = raw
+    static const float alphas[4] = {1.0f, 0.4f, 0.2f, 0.08f};
+    ema_alpha = alphas[g_cfg.pedal_filter > 3 ? 3 : g_cfg.pedal_filter];
+
+    // Brake response curve: output = input^gamma of normalized force
+    static const float gammas[3] = {1.0f, 1.35f, 1.8f};
+    brake_gamma = gammas[g_cfg.brake_curve > 2 ? 2 : g_cfg.brake_curve];
+}
+
 void pedals_init(
     int clutch_adc_pin,
     int gas_adc_pin,
-    int clutch_adc_min,
-    int clutch_adc_max,
-    int gas_adc_min,
-    int gas_adc_max,
     int brake_hx711_dout_pin,
-    int brake_hx711_sck_pin,
-    int32_t brake_counts_fullscale) {
+    int brake_hx711_sck_pin) {
 
     clutch_pin = clutch_adc_pin;
     gas_pin = gas_adc_pin;
-
-    clutch_adc_min = clamp_adc(clutch_adc_min);
-    clutch_adc_max = clamp_adc(clutch_adc_max);
-    gas_adc_min = clamp_adc(gas_adc_min);
-    gas_adc_max = clamp_adc(gas_adc_max);
-
-    if (clutch_adc_max < clutch_adc_min) {
-        int t = clutch_adc_min;
-        clutch_adc_min = clutch_adc_max;
-        clutch_adc_max = t;
-    }
-    if (gas_adc_max < gas_adc_min) {
-        int t = gas_adc_min;
-        gas_adc_min = gas_adc_max;
-        gas_adc_max = t;
-    }
-
-    clutch_min_adc = clutch_adc_min;
-    clutch_max_adc = clutch_adc_max;
-    gas_min_adc = gas_adc_min;
-    gas_max_adc = gas_adc_max;
 
     if (clutch_pin >= 0) pinMode(clutch_pin, INPUT);
     if (gas_pin >= 0) pinMode(gas_pin, INPUT);
 
     analogReadResolution(12);
 
-    if (brake_counts_fullscale < 1000) brake_counts_fullscale = 1000;
-    brake_fullscale_counts = brake_counts_fullscale;
+    pedals_apply_config();
 
     brake_initialized = false;
     if (brake_hx711_dout_pin >= 0 && brake_hx711_sck_pin >= 0) {
@@ -104,9 +120,8 @@ void pedals_init(
         }
     }
 
-    clutch_hid = 0;
-    gas_hid = 0;
-    brake_hid = 0;
+    clutch_f = gas_f = brake_f = 0.0f;
+    clutch_hid = gas_hid = brake_hid = 0;
     last_update_ms = 0;
     pedals_initialized = true;
 }
@@ -122,16 +137,20 @@ void pedals_update() {
 
     if (clutch_pin >= 0) {
         int raw = analogRead(clutch_pin);
+        clutch_raw = (uint16_t)clamp_adc(raw);
         float norm = normalize_adc(raw, clutch_min_adc, clutch_max_adc);
-        clutch_hid = unit_to_hid16(norm);
+        clutch_f += ema_alpha * (norm - clutch_f);
+        clutch_hid = unit_to_hid16(clutch_f);
     } else {
         clutch_hid = 0;
     }
 
     if (gas_pin >= 0) {
         int raw = analogRead(gas_pin);
+        gas_raw = (uint16_t)clamp_adc(raw);
         float norm = normalize_adc(raw, gas_min_adc, gas_max_adc);
-        gas_hid = unit_to_hid16(norm);
+        gas_f += ema_alpha * (norm - gas_f);
+        gas_hid = unit_to_hid16(gas_f);
     } else {
         gas_hid = 0;
     }
@@ -144,23 +163,22 @@ void pedals_update() {
         // updates and VESC commands.
         if (brake_loadcell.wait_ready_timeout(1)) {
             int32_t raw = brake_loadcell.read();
-            int32_t delta = raw - brake_zero_counts;
-            float norm = (float)delta / (float)brake_fullscale_counts;
-            brake_hid = unit_to_hid16(norm);
+            brake_raw_delta = raw - brake_zero_counts;
+            float norm = clamp01((float)brake_raw_delta / (float)brake_fullscale_counts);
+            if (brake_gamma != 1.0f) norm = powf(norm, brake_gamma);
+            // Load cell samples arrive at 10-80Hz; only fold new readings in.
+            brake_f += 0.5f * (norm - brake_f);
+            brake_hid = unit_to_hid16(brake_f);
         }
-    } else {
+    } else if (!brake_initialized) {
         brake_hid = 0;
     }
 }
 
-uint16_t pedals_get_clutch_hid16() {
-    return clutch_hid;
-}
+uint16_t pedals_get_clutch_hid16() { return clutch_hid; }
+uint16_t pedals_get_gas_hid16() { return gas_hid; }
+uint16_t pedals_get_brake_hid16() { return brake_hid; }
 
-uint16_t pedals_get_gas_hid16() {
-    return gas_hid;
-}
-
-uint16_t pedals_get_brake_hid16() {
-    return brake_hid;
-}
+uint16_t pedals_get_clutch_raw() { return clutch_raw; }
+uint16_t pedals_get_gas_raw() { return gas_raw; }
+int32_t pedals_get_brake_raw() { return brake_raw_delta; }

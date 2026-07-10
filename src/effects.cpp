@@ -1,54 +1,35 @@
 #include "effects.h"
 #include "hid.h"
+#include "config.h"
 #include <Arduino.h>
 #include <math.h>
-#define CTRL_HZ 1000UL
-#define EFFECT_TIMEOUT_MS 500
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
+bool ffb_verbose = false;
 float device_gain = 1.0f;
-unsigned long last_effect_time = 0;
-bool effect_constant_active = false;
-float effect_constant_nm = 0.0f;
-bool effect_spring_active = false;
-float effect_spring_k = 0.0f;
-float effect_spring_center = 0.0f;
-bool effect_damper_active = false;
-float effect_damper_b = 0.0f;
-bool effect_ramp_active = false;
-float effect_ramp_start = 0.0f;
-float effect_ramp_end = 0.0f;
-float effect_ramp_duration = 0.0f;
-unsigned long effect_ramp_start_time = 0;
-bool effect_inertia_active = false;
-float effect_inertia = 0.0f;
+bool device_paused = false;
+volatile float g_ffb_torque_nm = 0.0f;
 
-// Additional effects
-bool effect_friction_active = false;
-float effect_friction_coeff = 0.0f;
-bool effect_periodic_active = false;
-int effect_periodic_type = 0;
-float effect_periodic_amp = 0.0f;
-float effect_periodic_freq = 1.0f;
-float effect_conditional_active = 0.0f;
-float effect_conditional_param = 0.0f;
+// Normalization full-scales for condition-effect metrics. The PID spec works
+// in normalized units; these define what "1.0" means physically on this wheel.
+static constexpr float DAMPER_VEL_FS = 2.0f * (float)M_PI;  // rad/s -> full damper force
+static constexpr float INERTIA_ACC_FS = 40.0f;              // rad/s^2 -> full inertia force
+static constexpr float FRICTION_V_KNEE = 0.08f;             // rad/s, friction saturation knee
 
-float ffb_scale_constant = 1.0f;
-float ffb_scale_spring = 1.0f;
-float ffb_scale_damper = 1.0f;
-float ffb_scale_inertia = 1.0f;
-float ffb_scale_friction = 1.0f;
-float ffb_scale_periodic = 1.0f;
-float ffb_scale_conditional = 1.0f;
+// Host-silence watchdog: if host-driven forces are active but no FFB report
+// has arrived for this long, fade them out (springs/dampers persist — they
+// are computed locally from position and are safe without host updates).
+static constexpr uint32_t HOST_SILENCE_MS = 2000;
+static constexpr float FADE_OUT_S = 0.2f;
+static constexpr float FADE_IN_S = 0.05f;
 
-// Configuration
-float gear_ratio = 1.0f; // motor:wheel
-float max_wheel_angle_deg = 900.0f; // default 900 degrees lock-to-lock (typical sim wheel)
-float angle_limit_stiffness = 100.0f; // Nm/rad - strength of angle limiting spring
-
-bool ffb_verbose = false; // Disabled to avoid USB/Serial conflicts
-
-// Effect block storage for more complete FFB handling
 static EffectBlock blocks[MAX_EFFECT_BLOCKS];
+static SemaphoreHandle_t block_mutex = nullptr;
+
+static uint32_t last_host_report_ms = 0;
+static uint32_t pause_started_ms = 0;
+static uint32_t paused_total_ms = 0;
 
 // Linux hid-pidff block-load/pool state
 static uint8_t pid_block_load_effect_idx = 1;      // 1..MAX_EFFECT_BLOCKS
@@ -58,31 +39,36 @@ static uint16_t pid_ram_pool_available = 4096;
 static uint8_t pid_simultaneous_max = MAX_EFFECT_BLOCKS;
 static uint8_t pid_device_managed_pool = 1;
 
-bool ffb_has_active_effects() {
-    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
-        if (blocks[i].in_use && blocks[i].active) {
-            return true;
-        }
-    }
+// Pipeline state (only touched from the FFB task)
+static float recon_state = 0.0f;      // reconstruction LPF on host magnitudes
+static float slew_state = 0.0f;       // last torque out of the slew limiter
+static float host_fade = 1.0f;        // watchdog fade factor 0..1
+static float filtered_accel = 0.0f;
+static float last_vel = 0.0f;
+static float osc_level = 0.0f;        // oscillation-guard engagement 0..1
 
-    return effect_constant_active ||
-           effect_spring_active ||
-           effect_damper_active ||
-           effect_ramp_active ||
-           effect_inertia_active ||
-           effect_friction_active ||
-           effect_periodic_active;
+static inline void lock_blocks() {
+    if (block_mutex) xSemaphoreTake(block_mutex, portMAX_DELAY);
+}
+static inline void unlock_blocks() {
+    if (block_mutex) xSemaphoreGive(block_mutex);
 }
 
-// Helper: allocate or get block index
-static int find_free_block() {
-    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) if (!blocks[i].in_use) return i;
-    return -1;
+// Effects clock: freezes while the device is paused so effect timelines
+// resume where they left off (PID Device Pause / Continue).
+static inline uint32_t eff_now_ms() {
+    uint32_t now = millis() - paused_total_ms;
+    if (device_paused) now -= (millis() - pause_started_ms);
+    return now;
 }
 
-static EffectBlock* get_block(uint8_t idx) {
-    if (idx >= MAX_EFFECT_BLOCKS) return NULL;
-    return &blocks[idx];
+void effects_init() {
+    if (!block_mutex) block_mutex = xSemaphoreCreateMutex();
+    last_host_report_ms = millis();
+}
+
+uint32_t effects_last_host_ms() {
+    return last_host_report_ms;
 }
 
 static uint8_t active_effect_count() {
@@ -93,6 +79,46 @@ static uint8_t active_effect_count() {
     return count;
 }
 
+uint8_t effects_get_active_block_count() {
+    return active_effect_count();
+}
+
+uint8_t effects_get_status_flags() {
+    uint8_t f = 0;
+    if (actuators_enabled) f |= 0x01;
+    if (device_paused) f |= 0x02;
+    if (hid_usb_active()) f |= 0x04;
+    if (host_fade < 0.99f) f |= 0x08;
+    return f;
+}
+
+bool ffb_has_active_effects() {
+    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
+        if (blocks[i].in_use && blocks[i].active) return true;
+    }
+    return false;
+}
+
+void effects_all_stop() {
+    lock_blocks();
+    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
+        blocks[i].active = false;
+    }
+    unlock_blocks();
+    effect_playing = 0;
+    hid_notify_pid_state_changed();
+}
+
+static int find_free_block() {
+    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) if (!blocks[i].in_use) return i;
+    return -1;
+}
+
+static EffectBlock *get_block(uint8_t idx) {
+    if (idx >= MAX_EFFECT_BLOCKS) return NULL;
+    return &blocks[idx];
+}
+
 static void update_ram_pool_available() {
     // Simple accounting model: each allocated block consumes 256 bytes.
     const uint16_t bytes_per_block = 256;
@@ -101,207 +127,316 @@ static void update_ram_pool_available() {
     else pid_ram_pool_available = pid_ram_pool_size - used;
 }
 
-// Helper to clear a block
 static void clear_block(EffectBlock *b) {
     if (!b) return;
     memset(b, 0, sizeof(EffectBlock));
 }
 
-// Compute a block's contribution to torque based on its type and current time
-static float compute_block_force(EffectBlock *b, float angle, float vel, float accel) {
-    if (!b || !b->in_use || !b->active) return 0.0f;
-    uint32_t now = millis();
-    if (b->duration_ms > 0 && (now - b->start_time_ms) >= b->duration_ms) {
-        b->active = false;
-        return 0.0f;
+static void refresh_effect_playing() {
+    effect_playing = 0;
+    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+        if (blocks[i].in_use && blocks[i].active) {
+            effect_playing = i + 1;
+            break;
+        }
     }
-    float tsec = (now - b->start_time_ms) / 1000.0f;
-    float mag = b->magnitude;
-    switch (b->type) {
-        case ET_CONSTANT:
-            if (ffb_verbose) Serial.printf("FFB: block const mag=%.3f gain=%.3f\n", mag, b->gain);
-            // magnitude is -1..1, scale to Nm (reasonable max ~10Nm for sim wheels)
-            return mag * b->gain * 10.0f * ffb_scale_constant;
-        case ET_RAMP: {
-            float frac = 0.0f;
-            if (b->duration_ms > 0) frac = min(1.0f, (now - b->start_time_ms) / (float)b->duration_ms);
-            float v = b->magnitude + (b->magnitude_end - b->magnitude) * frac;
-            return v * b->gain;
+}
+
+static inline float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// This wheel has a single FFB axis, so the only usable information in the
+// PID direction angle is which way the force points along X. PID/DirectInput
+// convention: 0 = north, 90deg = +X (right). Hosts that encode sign in the
+// magnitude typically send an axis-degenerate direction (0/180), which we
+// treat as "trust the signed magnitude". Global inversion for hosts with the
+// opposite convention is handled by g_cfg.invert_ffb.
+static float direction_sign(const EffectBlock *b) {
+    if (!b->direction_enable) return 1.0f;
+    float s = sinf(b->direction_rad);
+    if (fabsf(s) < 0.05f) return 1.0f;
+    return (s > 0.0f) ? 1.0f : -1.0f;
+}
+
+// Envelope scaling per the PID spec: magnitude interpolates from attack_level
+// at start and to fade_level over the last fade_time of a finite duration.
+static float envelope_scale(const EffectBlock *b, uint32_t t_active_ms) {
+    float s = 1.0f;
+    if (b->attack_time_ms > 0 && t_active_ms < b->attack_time_ms) {
+        float f = (float)t_active_ms / (float)b->attack_time_ms;
+        s = b->attack_level + (1.0f - b->attack_level) * f;
+    }
+    if (b->duration_ms > 0 && b->fade_time_ms > 0) {
+        uint32_t fade_start = (b->duration_ms > b->fade_time_ms)
+                                  ? (b->duration_ms - b->fade_time_ms) : 0;
+        if (t_active_ms >= fade_start) {
+            float f = (float)(t_active_ms - fade_start) / (float)b->fade_time_ms;
+            if (f > 1.0f) f = 1.0f;
+            float fs = 1.0f + (b->fade_level - 1.0f) * f;
+            if (fs < s) s = fs;
         }
-        case ET_SPRING: {
-            float k = b->param1; // stiffness in Nm/rad
-            float center = b->param2; // center in radians
-            if (ffb_verbose) Serial.printf("FFB: block spring k=%.3f center=%.3f\n", k, center);
-            float error = center - angle;
-            return k * error * b->gain * ffb_scale_spring;
+    }
+    return s;
+}
+
+// PID condition model: force = -coeff * (metric - offset +/- deadband),
+// clamped by the side's saturation. All inputs normalized to the metric's
+// full scale; returns normalized force -1..1.
+static float condition_force(const EffectBlock *b, float q_norm) {
+    float x = q_norm - b->cp_offset;
+    float t = 0.0f;
+    if (x > b->deadband) {
+        t = -b->pos_coeff * (x - b->deadband);
+        float sat = b->pos_sat > 0.0f ? b->pos_sat : 1.0f;
+        t = clampf(t, -sat, sat);
+    } else if (x < -b->deadband) {
+        t = -b->neg_coeff * (x + b->deadband);
+        float sat = b->neg_sat > 0.0f ? b->neg_sat : 1.0f;
+        t = clampf(t, -sat, sat);
+    }
+    return t;
+}
+
+static float wave_value(uint8_t wave, float phase) {
+    switch (wave) {
+        case WAVE_SINE:     return sinf(phase);
+        case WAVE_SQUARE:   return (sinf(phase) >= 0.0f) ? 1.0f : -1.0f;
+        case WAVE_TRIANGLE: return asinf(sinf(phase)) * (2.0f / (float)M_PI);
+        case WAVE_SAW_UP: {
+            float f = fmodf(phase / (2.0f * (float)M_PI), 1.0f);
+            if (f < 0.0f) f += 1.0f;
+            return f * 2.0f - 1.0f;
         }
-        case ET_DAMPER: {
-            float bcoef = b->param1; // damping coefficient in Nm/(rad/s)
-            // damper opposes motion
-            return -bcoef * vel * b->gain * ffb_scale_damper;
-        }
-        case ET_INERTIA: {
-            float mass = b->param1; // Moment of Inertia
-            // inertia opposes acceleration
-            return -mass * accel * b->gain * ffb_scale_inertia;
-        }
-        case ET_FRICTION: {
-            float coeff = b->param1 > 0.0f ? b->param1 : (fabsf(mag) * 5.0f); // friction coefficient scaled to Nm
-            // friction opposes motion (velocity-independent coulomb friction)
-            if (fabsf(vel) < 0.01f) return 0.0f; // deadzone to avoid chatter
-            return -coeff * (vel >= 0 ? 1.0f : -1.0f) * b->gain * ffb_scale_friction;
-        }
-        case ET_PERIODIC: {
-            float phase = b->phase + 2.0f * M_PI * b->freq_hz * tsec;
-            float val = 0.0f;
-            // b->param1 used for type: 0=sine, 1=square, 2=triangle, 3=sawup, 4=sawdown
-            int ptype = (int)b->param1;
-            switch (ptype) {
-                case 0: val = sinf(phase); break; // sine
-                case 1: val = (sinf(phase) >= 0) ? 1.0f : -1.0f; break; // square
-                case 2: val = asinf(sinf(phase)) * (2.0f / M_PI); break; // triangle
-                case 3: val = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break; // saw up
-                case 4: val = -(fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f); break; // saw down (inverted saw up)
-            }
-            if (ffb_verbose) Serial.printf("FFB: block periodic type=%d freq=%.2f amp=%.3f\n", ptype, b->freq_hz, mag);
-            // magnitude scaled to Nm
-            return val * mag * b->gain * 8.0f * ffb_scale_periodic;
-        }
-        case ET_CONDITION: {
-            // For a simple condition: use param1 as deadband/threshold modifier
-            float threshold = b->param1;
-            if (fabsf(angle - b->direction_rad) < threshold) return mag * b->gain * 8.0f * ffb_scale_conditional;
-            return 0.0f;
+        case WAVE_SAW_DOWN: {
+            float f = fmodf(phase / (2.0f * (float)M_PI), 1.0f);
+            if (f < 0.0f) f += 1.0f;
+            return -(f * 2.0f - 1.0f);
         }
     }
     return 0.0f;
 }
 
-float mix_effects(float angle, float vel) {
-    // Compute only when there is something to play.
-    if (!ffb_has_active_effects()) {
-        return 0.0f; // No force if actuators disabled
-    }
-    
-    // Calculate acceleration for Inertia effects
-    static float last_vel = 0.0f;
-    static unsigned long last_calc = 0;
-    unsigned long now = millis();
-    float dt = (now - last_calc) / 1000.0f;
-    if (dt <= 0) dt = 0.001f;
-    last_calc = now;
-    
-    float accel = (vel - last_vel) / dt; 
+// Compute one block's contribution. Host-magnitude forces (constant/ramp) go
+// to *host_out so the reconstruction filter can smooth the host's update
+// staircase; locally-synthesized periodic goes to *periodic_out; condition
+// forces (computed from live position/velocity) go to *cond_out. Outputs are
+// normalized (-1..1 of max torque).
+static void compute_block(EffectBlock *b, float angle, float vel, float accel,
+                          float half_range, float dt, uint32_t now,
+                          float *host_out, float *periodic_out, float *cond_out) {
+    if (!b->in_use || !b->active) return;
 
-    // Fallback velocity from angle derivative to keep condition effects responsive
-    // even if encoder-reported velocity is under-scaled or noisy.
-    static float last_angle = 0.0f;
-    float angle_delta = angle - last_angle;
-    while (angle_delta > M_PI) angle_delta -= 2.0f * M_PI;
-    while (angle_delta < -M_PI) angle_delta += 2.0f * M_PI;
-    float derived_vel = angle_delta / dt;
-    last_angle = angle;
-    if (fabsf(derived_vel) > fabsf(vel)) {
-        vel = derived_vel;
-    }
+    uint32_t t = now - b->start_time_ms;
+    if (t < b->start_delay_ms) return;
+    uint32_t ta = t - b->start_delay_ms;
 
-    // Low pass filter acceleration to reduce noise
-    static float filtered_accel = 0.0f;
-    filtered_accel = 0.1f * accel + 0.9f * filtered_accel;
-    last_vel = vel;
-    
-    float tau = 0.0f;
-    
-    // Angle limiting: enforce max wheel angle with spring force
-    // angle is now centered (-PI..PI) where 0 = center position
-    float max_angle_rad = max_wheel_angle_deg * M_PI / 180.0f;
-    float half_max = max_angle_rad / 2.0f;
-    
-    // Apply boundary spring force if exceeding limits
-    // angle > 0 is clockwise (right), angle < 0 is counter-clockwise (left)
-    if (angle > half_max) {
-        float excess = angle - half_max;
-        tau += -angle_limit_stiffness * excess; // push back toward limit
-    } else if (angle < -half_max) {
-        float excess = angle + half_max;
-        tau += -angle_limit_stiffness * excess; // push back toward limit
-    }
-    
-    // Compute effect blocks (new system)
-    for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
-        tau += compute_block_force(&blocks[i], angle, vel, filtered_accel);
-    }
-    
-    // Legacy effects (backward compatibility) - scaled properly to Nm
-    if (effect_constant_active) tau += effect_constant_nm * 10.0f * ffb_scale_constant; // scale to Nm
-    if (effect_spring_active)  tau += effect_spring_k * (effect_spring_center - angle) * ffb_scale_spring;
-    if (effect_damper_active)  tau += -effect_damper_b * vel * ffb_scale_damper;
-    if (effect_ramp_active && effect_ramp_duration > 0) {
-        unsigned long now = millis();
-        float t = (float)(now - effect_ramp_start_time);
-        if (t >= effect_ramp_duration) {
-            tau += effect_ramp_end;
-            effect_ramp_active = false;
+    if (b->duration_ms > 0 && ta >= b->duration_ms) {
+        if (b->loop_count == 0xFF || b->loop_count > 1) {
+            if (b->loop_count != 0xFF) b->loop_count--;
+            b->start_time_ms = now - b->start_delay_ms;
+            b->phase_acc = 0.0f;
+            ta = 0;
         } else {
-            float ramp_val = effect_ramp_start + (effect_ramp_end - effect_ramp_start) * (t / effect_ramp_duration);
-            tau += ramp_val;
+            b->active = false;
+            return;
         }
     }
 
-    if (effect_inertia_active) {
-        tau += -effect_inertia * filtered_accel * ffb_scale_inertia;
-    }
-    // friction (legacy)
-    if (effect_friction_active && fabsf(vel) > 0.01f) {
-        tau += -effect_friction_coeff * 5.0f * (vel >= 0 ? 1.0f : -1.0f) * ffb_scale_friction; // scale to Nm
-    }
-    // periodic (legacy)
-    if (effect_periodic_active && effect_periodic_amp != 0.0f) {
-        float t = (float)millis() / 1000.0f;
-        float pval = 0.0f;
-        float phase = 2.0f * M_PI * effect_periodic_freq * t;
-        switch (effect_periodic_type) {
-            case 0: pval = sinf(phase); break; // sine
-            case 1: pval = (sinf(phase) >= 0) ? 1.0f : -1.0f; break; // square
-            case 2: pval = asinf(sinf(phase)) * (2.0f / M_PI); break; // triangle (approx)
-            case 3: pval = fmodf(phase / (2.0f * M_PI), 1.0f) * 2.0f - 1.0f; break; // saw approx
+    float env = envelope_scale(b, ta);
+    float dsign = direction_sign(b);
+
+    switch (b->type) {
+        case ET_CONSTANT:
+            *host_out += b->magnitude * env * b->gain * dsign;
+            break;
+        case ET_RAMP: {
+            float frac = (b->duration_ms > 0) ? ((float)ta / (float)b->duration_ms) : 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            float v = b->magnitude + (b->magnitude_end - b->magnitude) * frac;
+            *host_out += v * env * b->gain * dsign;
+            break;
         }
-        tau += effect_periodic_amp * pval * 8.0f * ffb_scale_periodic; // scale to Nm
-    }
-    
-    // Apply device gain
-    tau *= device_gain;
-    
-    // Timeout handling: clear stale legacy flags only when no active PID effect exists
-    if (millis() - last_effect_time > EFFECT_TIMEOUT_MS) {
-        bool any_pid_active = false;
-        for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
-            if (blocks[i].in_use && blocks[i].active) {
-                any_pid_active = true;
-                break;
+        case ET_PERIODIC: {
+            b->phase_acc += 2.0f * (float)M_PI * b->freq_hz * dt;
+            // Wrap early: float resolution above ~1e3 rad would add phase jitter.
+            if (b->phase_acc > 128.0f * (float)M_PI) {
+                b->phase_acc = fmodf(b->phase_acc, 2.0f * (float)M_PI);
             }
+            float w = wave_value(b->wave, b->phase0 + b->phase_acc);
+            float v = clampf(b->offset + b->magnitude * env * w, -1.0f, 1.0f);
+            *periodic_out += v * b->gain * dsign;
+            break;
         }
-
-        if (!any_pid_active) {
-            effect_constant_active = effect_spring_active = effect_damper_active = false;
-            effect_ramp_active = false;
-            effect_inertia_active = false;
-            effect_friction_active = false;
-            effect_periodic_active = false;
+        case ET_SPRING:
+            *cond_out += condition_force(b, angle / half_range) * b->gain;
+            break;
+        case ET_DAMPER:
+            *cond_out += condition_force(b, vel / DAMPER_VEL_FS) * b->gain;
+            break;
+        case ET_INERTIA:
+            *cond_out += condition_force(b, accel / INERTIA_ACC_FS) * b->gain;
+            break;
+        case ET_FRICTION: {
+            // Coulomb friction with a saturated-linear region near zero
+            // velocity so it doesn't chatter at rest.
+            float c = fmaxf(fabsf(b->pos_coeff), fabsf(b->neg_coeff));
+            float s = clampf(vel / FRICTION_V_KNEE, -1.0f, 1.0f);
+            *cond_out += -c * s * b->gain;
+            break;
         }
     }
-    return tau;
 }
 
+float effects_compute_torque(float angle, float vel, float dt) {
+    if (!(dt > 0.0f) || dt > 0.1f) dt = 0.001f;
 
-// Helper to convert 16-bit signed magnitude (-32767..32767) to float in [-1..1]
+    // Acceleration estimate for inertia effects (lightly low-passed)
+    float accel = (vel - last_vel) / dt;
+    last_vel = vel;
+    filtered_accel += 0.08f * (accel - filtered_accel);
+
+    float half_range = 0.5f * g_cfg.wheel_range_deg * (float)M_PI / 180.0f;
+    if (half_range < 0.1f) half_range = 0.1f;
+    float max_t = g_cfg.max_torque_nm;
+
+    bool gate_open = actuators_enabled && !device_paused && hid_usb_active();
+
+    float host_n = 0.0f, periodic_n = 0.0f, cond_n = 0.0f;
+    bool any_host_force = false;
+
+    if (gate_open) {
+        uint32_t now = eff_now_ms();
+        lock_blocks();
+        for (int i = 0; i < MAX_EFFECT_BLOCKS; ++i) {
+            EffectBlock *b = &blocks[i];
+            compute_block(b, angle, vel, filtered_accel, half_range, dt, now,
+                          &host_n, &periodic_n, &cond_n);
+            if (b->in_use && b->active &&
+                (b->type == ET_CONSTANT || b->type == ET_RAMP || b->type == ET_PERIODIC)) {
+                any_host_force = true;
+            }
+        }
+        if (effect_playing > 0 && !ffb_has_active_effects()) {
+            effect_playing = 0;
+            hid_notify_pid_state_changed();
+        }
+        unlock_blocks();
+    }
+
+    // Host-silence watchdog: fade host-driven forces if the host went quiet.
+    bool host_stale = any_host_force &&
+                      (millis() - last_host_report_ms) > HOST_SILENCE_MS;
+    if (host_stale) {
+        host_fade -= dt / FADE_OUT_S;
+    } else {
+        host_fade += dt / FADE_IN_S;
+    }
+    host_fade = clampf(host_fade, 0.0f, 1.0f);
+
+    // Reconstruction filter: hosts update constant/ramp magnitudes at their
+    // own rate (60-400Hz); smoothing the staircase here is what removes the
+    // "grainy" feel. Periodic and condition forces are synthesized locally at
+    // full rate and must stay crisp, so they bypass the filter.
+    float host_target = host_n * max_t;
+    if (g_cfg.recon_cutoff_hz > 0.0f) {
+        float rc = 1.0f / (2.0f * (float)M_PI * g_cfg.recon_cutoff_hz);
+        float a = dt / (dt + rc);
+        recon_state += a * (host_target - recon_state);
+    } else {
+        recon_state = host_target;
+    }
+
+    float game_t = (recon_state + periodic_n * max_t) * host_fade;
+    if (g_cfg.invert_ffb) game_t = -game_t;
+    game_t += cond_n * max_t;
+    game_t *= device_gain;
+
+    // Static-friction/cogging compensation (experimental, default off)
+    if (g_cfg.breakaway && fabsf(game_t) > 0.02f) {
+        game_t += (game_t > 0.0f ? 1.0f : -1.0f) * g_cfg.breakaway_nm;
+    }
+
+    // Device-side base feel under the game's FFB
+    game_t += -g_cfg.base_damper * vel;
+    game_t += -g_cfg.base_friction_nm * clampf(vel / FRICTION_V_KNEE, -1.0f, 1.0f);
+    game_t += -g_cfg.base_inertia * filtered_accel;
+
+    // Hands-off oscillation guard: sustained fast velocity reversals mean the
+    // wheel is shaking itself; blend in extra damping until it settles.
+    if (g_cfg.osc_guard) {
+        static float ema_absvel = 0.0f;
+        static uint32_t window_start = 0;
+        static uint8_t flips = 0, flips_last = 0;
+        static float prev_vel = 0.0f;
+        ema_absvel += 0.01f * (fabsf(vel) - ema_absvel);
+        if ((vel > 0.5f && prev_vel < -0.5f) || (vel < -0.5f && prev_vel > 0.5f)) flips++;
+        if (fabsf(vel) > 0.5f) prev_vel = vel;
+        uint32_t nowms = millis();
+        if (nowms - window_start >= 250) {
+            window_start = nowms;
+            flips_last = flips;
+            flips = 0;
+        }
+        bool oscillating = (flips_last >= 4) && (ema_absvel > 6.0f);
+        float target = oscillating ? 1.0f : 0.0f;
+        float rate = oscillating ? (dt / 0.05f) : (dt / 0.5f);
+        osc_level += clampf(target - osc_level, -rate, rate);
+        float osc_damper = 0.06f * max_t; // Nm per rad/s at full engagement
+        game_t += -osc_level * osc_damper * vel;
+    }
+
+    // Clip game torque at the configured max — soft knee keeps clipped curbs
+    // and crashes from feeling like hitting a hard wall.
+    if (g_cfg.soft_clip) {
+        game_t = max_t * tanhf(game_t / max_t);
+    } else {
+        game_t = clampf(game_t, -max_t, max_t);
+    }
+
+    // Slew limit: bounds torque rate to kill discontinuity "clunks" without
+    // dulling normal detail.
+    if (g_cfg.slew_nm_per_ms > 0.0f) {
+        float max_step = g_cfg.slew_nm_per_ms * (dt * 1000.0f);
+        game_t = slew_state + clampf(game_t - slew_state, -max_step, max_step);
+    }
+    slew_state = game_t;
+
+    // End-stop overlay: progressive spring + damping inside the zone, with
+    // its own torque budget so it can always overpower game forces.
+    float total = game_t;
+    float excess = 0.0f;
+    if (angle > half_range) excess = angle - half_range;
+    else if (angle < -half_range) excess = angle + half_range;
+    if (excess != 0.0f) {
+        float t_end = -g_cfg.endstop_k * excess - g_cfg.endstop_d * vel;
+        t_end = clampf(t_end, -g_cfg.endstop_max_nm, g_cfg.endstop_max_nm);
+        total += t_end;
+    }
+    total = clampf(total, -(max_t + g_cfg.endstop_max_nm), max_t + g_cfg.endstop_max_nm);
+
+    if (!gate_open) {
+        recon_state = 0.0f;
+        slew_state = 0.0f;
+        total = 0.0f;
+    }
+
+    g_ffb_torque_nm = total;
+    return total;
+}
+
+// ----------------------
+// HID report parsing
+// ----------------------
+
 static float int16_to_unit(int16_t v) {
     return (float)v / 32767.0f;
 }
 
-// Helper to read 16-bit value from buffer (little-endian)
 static int16_t read_int16(uint8_t *buf, int offset) {
-    return (int16_t)((uint16_t)buf[offset] | ((uint16_t)buf[offset+1] << 8));
+    return (int16_t)((uint16_t)buf[offset] | ((uint16_t)buf[offset + 1] << 8));
 }
 
 static int16_t read_int16_safe(uint8_t *buf, uint16_t len, int offset, int16_t fallback = 0) {
@@ -309,167 +444,160 @@ static int16_t read_int16_safe(uint8_t *buf, uint16_t len, int offset, int16_t f
     return read_int16(buf, offset);
 }
 
-// Helper to read 8-bit unsigned value
-static uint8_t read_uint8(uint8_t *buf, int offset) {
+static uint8_t read_uint8_safe(uint8_t *buf, uint16_t len, int offset, uint8_t fallback = 0) {
+    if (!buf || offset < 0 || offset >= (int)len) return fallback;
     return buf[offset];
 }
 
-static uint8_t read_uint8_safe(uint8_t *buf, uint16_t len, int offset, uint8_t fallback = 0) {
-    if (!buf || offset < 0 || offset >= (int)len) return fallback;
-    return read_uint8(buf, offset);
+static void set_block_type_from_hid(EffectBlock *b, uint8_t effect_type) {
+    switch (effect_type) {
+        case 1:  b->type = ET_CONSTANT; break;
+        case 2:  b->type = ET_RAMP; break;
+        case 3:  b->type = ET_PERIODIC; b->wave = WAVE_SQUARE; break;
+        case 4:  b->type = ET_PERIODIC; b->wave = WAVE_SINE; break;
+        case 5:  b->type = ET_PERIODIC; b->wave = WAVE_TRIANGLE; break;
+        case 6:  b->type = ET_PERIODIC; b->wave = WAVE_SAW_UP; break;
+        case 7:  b->type = ET_PERIODIC; b->wave = WAVE_SAW_DOWN; break;
+        case 8:  b->type = ET_SPRING; break;
+        case 9:  b->type = ET_DAMPER; break;
+        case 10: b->type = ET_INERTIA; break;
+        case 11: b->type = ET_FRICTION; break;
+        default: b->type = ET_NONE; break;
+    }
 }
 
-// Parse incoming FFB report according to the USB HID PID specification
+// Parse incoming FFB report according to the USB HID PID descriptor in hid.cpp
 void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
-    // Update last effect time so mix_effects doesn't timeout
-    last_effect_time = millis();
+    last_host_report_ms = millis();
 
-    // Parse based on Report ID from the descriptor
+    lock_blocks();
+
     switch (report_id) {
-        case 0x03: { // Set Effect Report
-            // Format (Linux-compatible):
-            // [effect_index,
-            //  duration_lo, duration_hi,
-            //  gain_lo, gain_hi,
-            //  trigger_button,
-            //  trigger_repeat_lo, trigger_repeat_hi,
-            //  dir_enable,
-            //  direction_lo, direction_hi,
-            //  start_delay_lo, start_delay_hi,
-            //  effect_type]
+        case 0x03: { // Set Effect
+            // [idx, duration(2), gain(2), trigger_btn, trigger_repeat(2),
+            //  enables, direction1(2), direction2(2), start_delay(2), type]
             if (len < 1) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);  // 1-16
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
-            effect_idx--; // Convert to 0-15 array index
-            
+            effect_idx--;
+
             EffectBlock *b = get_block(effect_idx);
             if (!b) break;
             bool was_in_use = b->in_use;
-            
+
             uint16_t duration = (uint16_t)read_int16_safe(buf, len, 1, 0);
-            uint16_t gain16 = (uint16_t)read_int16_safe(buf, len, 3, 65535);
+            uint16_t gain16 = (uint16_t)read_int16_safe(buf, len, 3, (int16_t)0xFFFF);
+            uint8_t enables = read_uint8_safe(buf, len, 8, 0x02);
             uint16_t direction = (uint16_t)read_int16_safe(buf, len, 9, 0);
-            uint8_t effect_type = read_uint8_safe(buf, len, 13, b->type ? b->type : 4); // 1..11, default sine-like
-            
-            // Initialize the effect block
+            uint16_t start_delay = (uint16_t)read_int16_safe(buf, len, 13, 0);
+            uint8_t effect_type = read_uint8_safe(buf, len, 15, 0);
+
             b->in_use = 1;
-            
-            // Map USB HID effect types to internal EffectType
-            switch (effect_type) {
-                case 1: b->type = ET_CONSTANT; break;
-                case 2: b->type = ET_RAMP; break;
-                case 3: b->type = ET_PERIODIC; b->param1 = 1; break; // Square
-                case 4: b->type = ET_PERIODIC; b->param1 = 0; break; // Sine
-                case 5: b->type = ET_PERIODIC; b->param1 = 2; break; // Triangle
-                case 6: b->type = ET_PERIODIC; b->param1 = 3; break; // SawUp
-                case 7: b->type = ET_PERIODIC; b->param1 = 4; break; // SawDown
-                case 8: b->type = ET_SPRING; break;
-                case 9: b->type = ET_DAMPER; break;
-                case 10: b->type = ET_INERTIA; break;
-                case 11: b->type = ET_FRICTION; break;
-                default: b->type = ET_NONE; break;
+            if (effect_type >= 1 && effect_type <= 11) {
+                set_block_type_from_hid(b, effect_type);
             }
-            
-            b->active = false; // Wait for Effect Operation command to start
-            // Host duration unit scaling is descriptor-dependent and many stacks send values
-            // that are not directly milliseconds. Keep effects persistent by default and rely
-            // on Effect Operation STOP / Block Free from host to end playback.
-            // Explicitly keep HID "infinite" sentinels as persistent too.
+
+            // Duration is honest milliseconds now that the descriptor declares
+            // time units. HID "infinite" sentinels map to 0 (persistent).
             if (duration == 0 || duration == 0xFFFF || duration == 0x7FFF) {
                 b->duration_ms = 0;
-            } else if (duration < 32) {
-                // Heuristic: tiny values commonly represent seconds after host scaling.
-                b->duration_ms = duration * 1000UL;
             } else {
                 b->duration_ms = duration;
             }
             b->gain = gain16 / 65535.0f;
-            b->start_time_ms = 0;
-            // Linux direction is 0..65535, map around circle to radians
-            b->direction_rad = (direction / 65535.0f) * (2.0f * M_PI);
+            b->direction_enable = (enables & 0x02) != 0;
+            // Direction logical units: hundredths of degrees, 0..35999
+            if (direction > 35999) direction = 35999;
+            b->direction_rad = (float)direction * (2.0f * (float)M_PI / 36000.0f);
+            b->start_delay_ms = start_delay;
+
+            // A Set Effect on a playing block is a live parameter update
+            // (Linux FF_UPDATE / DirectInput SetParameters) — do not stop it.
             if (!was_in_use) {
+                b->active = false;
+                b->loop_count = 1;
                 update_ram_pool_available();
             }
-            
+
             if (ffb_verbose) {
-                Serial.printf("FFB: Set Effect idx=%d type=%d -> %d dur=%d gain=%.2f dir=%.2f\n", 
-                    effect_idx, effect_type, b->type, duration, b->gain, b->direction_rad);
+                Serial.printf("FFB: Set Effect idx=%d type=%d dur=%u dir=%.2f gain=%.2f\n",
+                              effect_idx, b->type, (unsigned)b->duration_ms,
+                              b->direction_rad, b->gain);
             }
         } break;
 
-        case 0x04: { // Set Envelope Report
-            // Format: [effect_index, attack_level, attack_time_lo, attack_time_hi,
-            //          fade_level, fade_time_lo, fade_time_hi]
-            if (len < 7) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);
+        case 0x04: { // Set Envelope
+            // [idx, attack_level(2), attack_time(2), fade_level(2), fade_time(2)]
+            if (len < 3) break;
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
-            
-            // For now, we'll store envelope in param fields (can be expanded later)
+
             EffectBlock *b = get_block(effect_idx);
             if (!b || !b->in_use) break;
-            
-            // Could implement envelope shaping here
-            // For simplicity, we'll just note it was set
+
+            uint16_t attack_level = (uint16_t)read_int16_safe(buf, len, 1, 0);
+            uint16_t attack_time = (uint16_t)read_int16_safe(buf, len, 3, 0);
+            uint16_t fade_level = (uint16_t)read_int16_safe(buf, len, 5, 0);
+            uint16_t fade_time = (uint16_t)read_int16_safe(buf, len, 7, 0);
+
+            b->attack_level = clampf(attack_level / 32767.0f, 0.0f, 1.0f);
+            b->attack_time_ms = attack_time;
+            b->fade_level = clampf(fade_level / 32767.0f, 0.0f, 1.0f);
+            b->fade_time_ms = fade_time;
+
+            if (ffb_verbose) {
+                Serial.printf("FFB: Set Envelope idx=%d al=%.2f at=%u fl=%.2f ft=%u\n",
+                              effect_idx, b->attack_level, attack_time,
+                              b->fade_level, fade_time);
+            }
         } break;
 
-        case 0x05: { // Set Condition Report
-            // Format: [effect_index, param_block_offset,
-            //          cp_offset_lo, cp_offset_hi,
-            //          pos_coeff_lo, pos_coeff_hi,
-            //          neg_coeff_lo, neg_coeff_hi,
-            //          pos_sat_lo, pos_sat_hi,
-            //          neg_sat_lo, neg_sat_hi,
-            //          deadba                                                                                                                                                                                                                                                                                                              nd_lo, deadband_hi]
-            if (len < 8) break;
+        case 0x05: { // Set Condition
+            // [idx, param_block_offset, cp_offset(2), pos_coeff(2), neg_coeff(2),
+            //  pos_sat(2), neg_sat(2), deadband(2)]
+            if (len < 4) break;
 
-            uint8_t effect_idx = read_uint8(buf, 0);
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
 
             EffectBlock *b = get_block(effect_idx);
-            if (!b || !b->in_use) break;                                                                                                                                                                    
+            if (!b || !b->in_use) break;
+
+            // Single FFB axis: only parameter block 0 applies. Hosts send a
+            // second block for the (nonexistent) Y axis — must not clobber X.
+            uint8_t block_offset = read_uint8_safe(buf, len, 1, 0);
+            if (block_offset != 0) break;
 
             int16_t cp_offset = read_int16_safe(buf, len, 2, 0);
             int16_t pos_coeff = read_int16_safe(buf, len, 4, 0);
-            int16_t neg_coeff = read_int16_safe(buf, len, 6, 0);
+            int16_t neg_coeff = read_int16_safe(buf, len, 6, pos_coeff);
             int16_t pos_sat = read_int16_safe(buf, len, 8, 32767);
             int16_t neg_sat = read_int16_safe(buf, len, 10, 32767);
             int16_t deadband = read_int16_safe(buf, len, 12, 0);
 
-            float coeff_abs = fmaxf(fabsf(int16_to_unit(pos_coeff)), fabsf(int16_to_unit(neg_coeff)));
-            float sat_abs = fmaxf(fabsf(int16_to_unit(pos_sat)), fabsf(int16_to_unit(neg_sat)));
-            float deadband_rad = fabsf(int16_to_unit(deadband)) * M_PI;
-
-            if (b->type == ET_SPRING) {
-                b->param1 = coeff_abs * 180.0f; // Nm/rad
-                b->param2 = int16_to_unit(cp_offset) * M_PI;
-            } else if (b->type == ET_DAMPER) {
-                b->param1 = coeff_abs * 90.0f; // Nm/(rad/s)
-            } else if (b->type == ET_FRICTION) {
-                b->param1 = coeff_abs * 12.0f; // Nm static friction
-            } else if (b->type == ET_INERTIA) {
-                b->param1 = coeff_abs * 6.0f; // inertia-like torque scaling
-            }
-
-            // Store optional common condition limits in generic fields.
-            b->magnitude = sat_abs;
-            b->magnitude_end = deadband_rad;
+            b->cp_offset = int16_to_unit(cp_offset);
+            b->pos_coeff = int16_to_unit(pos_coeff);
+            b->neg_coeff = int16_to_unit(neg_coeff);
+            b->pos_sat = fabsf(int16_to_unit(pos_sat));
+            b->neg_sat = fabsf(int16_to_unit(neg_sat));
+            b->deadband = fabsf(int16_to_unit(deadband));
 
             if (ffb_verbose) {
-                Serial.printf("FFB: Set Condition idx=%d type=%d cp=%d pos=%d neg=%d ps=%d ns=%d db=%d\n",
-                    effect_idx, b->type, cp_offset, pos_coeff, neg_coeff, pos_sat, neg_sat, deadband);
+                Serial.printf("FFB: Set Condition idx=%d cp=%.2f pc=%.2f nc=%.2f ps=%.2f ns=%.2f db=%.2f\n",
+                              effect_idx, b->cp_offset, b->pos_coeff, b->neg_coeff,
+                              b->pos_sat, b->neg_sat, b->deadband);
             }
         } break;
 
-        case 0x06: { // Set Periodic Report
-            // Format: [effect_index, magnitude_lo, magnitude_hi, offset_lo, offset_hi,
-            //          phase_lo, phase_hi, period_lo, period_hi]
+        case 0x06: { // Set Periodic
+            // [idx, magnitude(2), offset(2), phase(2), period(2)]
             if (len < 3) break;
 
-            uint8_t effect_idx = read_uint8(buf, 0);
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
 
@@ -481,216 +609,192 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             uint16_t phase = (uint16_t)read_int16_safe(buf, len, 5, 0);
             uint16_t period = (uint16_t)read_int16_safe(buf, len, 7, 0);
 
-            b->type = ET_PERIODIC;
             b->magnitude = int16_to_unit(magnitude);
-            b->phase = (phase / 65535.0f) * 2.0f * M_PI;
-            // If host/unit conversion collapses period to 0, use a rumble-like fallback.
-            b->freq_hz = (period > 0) ? (1000.0f / period) : 80.0f;
+            b->offset = int16_to_unit(offset);
+            // Phase logical units: hundredths of degrees
+            if (phase > 35999) phase = 35999;
+            b->phase0 = (float)phase * (2.0f * (float)M_PI / 36000.0f);
+            if (period > 0) {
+                b->freq_hz = clampf(1000.0f / (float)period, 0.1f, 500.0f);
+            } else if (b->freq_hz <= 0.0f) {
+                b->freq_hz = 80.0f; // rumble-like fallback if host never set one
+            }
 
             if (ffb_verbose) {
-                Serial.printf("FFB: Set Periodic idx=%d mag=%.3f off=%.3f freq=%.2f phase=%.2f\n",
-                    effect_idx, b->magnitude, int16_to_unit(offset), b->freq_hz, b->phase);
+                Serial.printf("FFB: Set Periodic idx=%d mag=%.3f off=%.3f freq=%.2f\n",
+                              effect_idx, b->magnitude, b->offset, b->freq_hz);
             }
         } break;
 
-        case 0x07: { // Set Constant Force Report
-            // Format: [effect_index, magnitude_lo, magnitude_hi]
+        case 0x07: { // Set Constant Force
+            // [idx, magnitude(2)]
             if (len < 3) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
-            
+
             EffectBlock *b = get_block(effect_idx);
             if (!b || !b->in_use) break;
-            
-            int16_t magnitude = read_int16(buf, 1);
-            b->magnitude = int16_to_unit(magnitude);
-            b->type = ET_CONSTANT;
-            
+
+            b->magnitude = int16_to_unit(read_int16(buf, 1));
+
             if (ffb_verbose) {
                 Serial.printf("FFB: Set Constant idx=%d mag=%.3f\n", effect_idx, b->magnitude);
             }
         } break;
 
-        case 0x08: { // Set Ramp Force Report
-            // Format: [effect_index, ramp_start_lo, ramp_start_hi, ramp_end_lo, ramp_end_hi]
+        case 0x08: { // Set Ramp Force
+            // [idx, ramp_start(2), ramp_end(2)]
             if (len < 5) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
-            
+
             EffectBlock *b = get_block(effect_idx);
             if (!b || !b->in_use) break;
-            
-            int16_t ramp_start = read_int16(buf, 1);
-            int16_t ramp_end = read_int16(buf, 3);
-            b->type = ET_RAMP;
-            b->magnitude = int16_to_unit(ramp_start);
-            b->magnitude_end = int16_to_unit(ramp_end);
+
+            b->magnitude = int16_to_unit(read_int16(buf, 1));
+            b->magnitude_end = int16_to_unit(read_int16(buf, 3));
+
             if (ffb_verbose) {
                 Serial.printf("FFB: Set Ramp idx=%d start=%.3f end=%.3f\n",
-                    effect_idx, b->magnitude, b->magnitude_end);
+                              effect_idx, b->magnitude, b->magnitude_end);
             }
         } break;
 
-        case 0x09: { // Effect Operation Report (Start/Stop)
-            // Format: [effect_index, operation, loop_count]
+        case 0x09: { // Effect Operation
+            // [idx, operation (1=Start, 2=Start Solo, 3=Stop), loop_count]
             if (len < 2) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
-            
-            uint8_t operation = read_uint8(buf, 1); // 1=Start, 2=Stop
+
+            uint8_t operation = buf[1];
             uint8_t loop_count = read_uint8_safe(buf, len, 2, 0);
-            
+
             EffectBlock *b = get_block(effect_idx);
             if (!b || !b->in_use) break;
-            
-            if (operation == 1) { // Start
-                b->active = true;
-                b->start_time_ms = millis();
-                
-                // Update global effect_playing for PID State report
-                extern uint8_t effect_playing;
-                effect_playing = effect_idx + 1;
-                
-                if (ffb_verbose) {
-                    Serial.printf("FFB: Start Effect idx=%d loops=%u\n", effect_idx, loop_count);
-                }
-                hid_notify_pid_state_changed();
-            } else if (operation == 2) { // Stop
-                b->active = false;
-                
-                // Check if any effects still playing
-                extern uint8_t effect_playing;
-                effect_playing = 0;
-                for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
-                    if (blocks[i].in_use && blocks[i].active) {
-                        effect_playing = i + 1;
-                        break;
+
+            if (operation == 1 || operation == 2) {
+                if (operation == 2) { // Start Solo: stop everything else first
+                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
+                        if (i != effect_idx) blocks[i].active = false;
                     }
                 }
-                
-                if (ffb_verbose) {
-                    Serial.printf("FFB: Stop Effect idx=%d\n", effect_idx);
-                }
+                b->active = true;
+                b->start_time_ms = eff_now_ms();
+                b->phase_acc = 0.0f;
+                b->loop_count = (loop_count == 0) ? 1 : loop_count;
+                effect_playing = effect_idx + 1;
                 hid_notify_pid_state_changed();
+                if (ffb_verbose) {
+                    Serial.printf("FFB: Start%s idx=%d loops=%u\n",
+                                  operation == 2 ? " Solo" : "", effect_idx, loop_count);
+                }
+            } else if (operation == 3) {
+                b->active = false;
+                refresh_effect_playing();
+                hid_notify_pid_state_changed();
+                if (ffb_verbose) {
+                    Serial.printf("FFB: Stop idx=%d\n", effect_idx);
+                }
             }
         } break;
 
-        case 0x0A: { // Block Free Report
-            // Format: [effect_index]
+        case 0x0A: { // Block Free
             if (len < 1) break;
-            
-            uint8_t effect_idx = read_uint8(buf, 0);
+
+            uint8_t effect_idx = buf[0];
             if (effect_idx < 1 || effect_idx > MAX_EFFECT_BLOCKS) break;
             effect_idx--;
-            
+
             EffectBlock *b = get_block(effect_idx);
             if (b) {
-                bool was_playing = (effect_playing == (uint8_t)(effect_idx + 1));
                 clear_block(b);
                 update_ram_pool_available();
-                if (was_playing) {
-                    effect_playing = 0;
-                    for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
-                        if (blocks[i].in_use && blocks[i].active) {
-                            effect_playing = i + 1;
-                            break;
-                        }
-                    }
-                }
+                refresh_effect_playing();
                 hid_notify_pid_state_changed();
-                
                 if (ffb_verbose) {
                     Serial.printf("FFB: Block Free idx=%d\n", effect_idx);
                 }
             }
         } break;
 
-        case 0x0B: { // Device Control Report
-            // Format: [control] - 1=Enable, 2=Disable, 3=Stop All, 4=Reset, 5=Pause, 6=Continue
+        case 0x0B: { // Device Control
+            // [control] 1=Enable, 2=Disable, 3=Stop All, 4=Reset, 5=Pause, 6=Continue
             if (len < 1) break;
-            
-            uint8_t control = read_uint8(buf, 0);
-            extern bool actuators_enabled;
-            
-            switch (control) {
-                case 1: // Enable Actuators - CRITICAL
+
+            switch (buf[0]) {
+                case 1:
                     actuators_enabled = true;
                     hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Actuators ENABLED");
                     break;
-                    
-                case 2: // Disable Actuators
+                case 2:
                     actuators_enabled = false;
                     hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Actuators DISABLED");
                     break;
-                    
-                case 3: // Stop All Effects
+                case 3:
                     for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
-                        if (blocks[i].in_use) blocks[i].active = false;
+                        blocks[i].active = false;
                     }
                     effect_playing = 0;
                     hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Stop All Effects");
                     break;
-                    
-                case 4: // Device Reset
+                case 4:
                     for (int i = 0; i < MAX_EFFECT_BLOCKS; i++) {
                         clear_block(&blocks[i]);
                     }
                     device_gain = 1.0f;
                     actuators_enabled = true;
                     effect_playing = 0;
+                    if (device_paused) {
+                        paused_total_ms += millis() - pause_started_ms;
+                        device_paused = false;
+                    }
                     update_ram_pool_available();
                     hid_notify_pid_state_changed();
                     if (ffb_verbose) Serial.println("FFB: Device Reset");
                     break;
-                    
-                case 5: // Pause
-                    // Could implement pausing logic
+                case 5:
+                    if (!device_paused) {
+                        device_paused = true;
+                        pause_started_ms = millis();
+                        hid_notify_pid_state_changed();
+                    }
                     break;
-                    
-                case 6: // Continue
-                    // Resume from pause
+                case 6:
+                    if (device_paused) {
+                        paused_total_ms += millis() - pause_started_ms;
+                        device_paused = false;
+                        hid_notify_pid_state_changed();
+                    }
                     break;
             }
         } break;
 
-        case 0x0C: { // Device Gain Report
-            // Format: [gain_lo, gain_hi]
+        case 0x0C: { // Device Gain
             if (len < 2) break;
-            uint16_t gain16 = (uint16_t)read_int16(buf, 0);
-            device_gain = gain16 / 65535.0f;
-            
+            device_gain = (uint16_t)read_int16(buf, 0) / 65535.0f;
             if (ffb_verbose) {
-                Serial.printf("FFB: Device Gain set to %.2f\n", device_gain);
+                Serial.printf("FFB: Device Gain %.2f\n", device_gain);
             }
         } break;
 
         case 0x0D: { // Create New Effect (Feature SET)
-            // Format: [report-level byte, effect_type]
-            // Host implementations vary; detect any valid type byte (1..11).
-            if (len < 1) break;
+            // [effect_block_index (unused), effect_type]
             uint8_t effect_type = 0;
-            for (uint16_t i = 0; i < len; ++i) {
-                uint8_t candidate = read_uint8(buf, i);
-                if (candidate >= 1 && candidate <= 11) {
-                    effect_type = candidate;
-                    break;
-                }
-            }
-            if (effect_type == 0) {
+            if (len >= 2) effect_type = buf[1];
+            else if (len == 1) effect_type = buf[0];
+
+            if (effect_type < 1 || effect_type > 11) {
                 pid_block_load_status = 3; // error
                 pid_block_load_effect_idx = 1;
-                if (ffb_verbose) {
-                    Serial.printf("FFB: Create New Effect invalid payload len=%u\n", (unsigned)len);
-                }
                 break;
             }
 
@@ -703,56 +807,38 @@ void handle_ffb_report(uint8_t report_id, uint8_t *buf, uint16_t len) {
             }
 
             EffectBlock *b = get_block((uint8_t)free_idx);
-            if (!b) {
-                pid_block_load_status = 3; // error
-                pid_block_load_effect_idx = 1;
-                break;
-            }
-
             clear_block(b);
             b->in_use = 1;
             b->active = false;
             b->gain = 1.0f;
+            b->loop_count = 1;
             b->duration_ms = 0;
-
-            switch (effect_type) {
-                case 1: b->type = ET_CONSTANT; break;
-                case 2: b->type = ET_RAMP; break;
-                case 3: b->type = ET_PERIODIC; b->param1 = 1; break;
-                case 4: b->type = ET_PERIODIC; b->param1 = 0; break;
-                case 5: b->type = ET_PERIODIC; b->param1 = 2; break;
-                case 6: b->type = ET_PERIODIC; b->param1 = 3; break;
-                case 7: b->type = ET_PERIODIC; b->param1 = 4; break;
-                case 8: b->type = ET_SPRING; break;
-                case 9: b->type = ET_DAMPER; break;
-                case 10: b->type = ET_INERTIA; break;
-                case 11: b->type = ET_FRICTION; break;
-                default: b->type = ET_NONE; break;
-            }
+            set_block_type_from_hid(b, effect_type);
 
             pid_block_load_effect_idx = (uint8_t)(free_idx + 1);
             pid_block_load_status = (b->type == ET_NONE) ? 3 : 1;
             update_ram_pool_available();
 
             if (ffb_verbose) {
-                Serial.printf("FFB: Create New Effect type=%u -> idx=%u status=%u\n",
-                    effect_type, pid_block_load_effect_idx, pid_block_load_status);
+                Serial.printf("FFB: Create New Effect type=%u -> idx=%u\n",
+                              effect_type, pid_block_load_effect_idx);
             }
         } break;
 
         default:
-            // Unknown report ID
             if (ffb_verbose) {
                 Serial.printf("FFB: Unknown report ID 0x%02X len=%d\n", report_id, len);
             }
             break;
     }
+
+    unlock_blocks();
 }
 
 uint16_t ffb_get_feature_report(uint8_t report_id, uint8_t *buffer, uint16_t len) {
     if (!buffer || len == 0) return 0;
 
-    // Report ID 2: PID State (descriptor exposes this as Input; keep GET_FEATURE fallback)
+    // Report ID 2: PID State (descriptor exposes this as Input; keep GET fallback)
     if (report_id == 0x02) {
         if (len < 2) return 0;
         uint8_t status = 0;

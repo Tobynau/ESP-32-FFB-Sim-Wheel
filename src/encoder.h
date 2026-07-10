@@ -21,13 +21,13 @@ float encoder_read_angle_rad();
 // Read angle relative to center/power-on position (continuous radians, 0=center)
 float encoder_read_centered_angle_rad();
 
-// Set the current wheel position as the new center (zero) angle.
-void encoder_recenter();
-
 // Read current angular velocity in rad/s (simple derivative, filtered)
 float encoder_read_vel_rads();
 
 // Update sampling (call from loop or timer). Returns true when new sample taken.
 bool encoder_update();
+
+// Set the current physical position as center (per-boot; not persisted).
+void encoder_set_center();
 
 #endif // ENCODER_H
