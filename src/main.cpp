@@ -118,6 +118,7 @@ static void comm_task(void *arg) {
     // Process as many queued FFB reports as available each cycle to
     // minimise latency between host effect updates and motor output.
     hid_process_reports(32);
+    config_process_pending();
 
     uint32_t now_us = usec();
     uint32_t now_ms = millis();

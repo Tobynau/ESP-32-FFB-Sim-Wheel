@@ -357,7 +357,10 @@ async function action(command, label) {
   try {
     await sendCommand(command);
     log(label);
-    if (command !== CMD.CENTER) await readConfig(); // reflect firmware clamping / defaults / reload
+    // Firmware applies the report from its comm task (NVS save can take a
+    // few ms); wait before reading back so we see clamped/reloaded values.
+    await new Promise(r => setTimeout(r, 150));
+    if (command !== CMD.CENTER) await readConfig();
   } catch (e) { log(`${label} failed: ${e.message}`); }
 }
 

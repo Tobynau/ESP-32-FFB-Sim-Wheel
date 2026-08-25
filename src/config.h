@@ -61,6 +61,10 @@ void config_defaults();
 bool config_save();
 uint16_t config_fill_wire(uint8_t *buf, uint16_t maxlen);
 void config_apply_wire(const uint8_t *buf, uint16_t len);
+// USB-task-safe path: stash a SET report, then apply it from comm_task.
+// NVS writes must not run on the TinyUSB task (small stack, flash cache off).
+void config_queue_wire(const uint8_t *buf, uint16_t len);
+void config_process_pending();
 uint16_t telemetry_fill_wire(uint8_t *buf, uint16_t maxlen);
 
 #endif // CONFIG_H

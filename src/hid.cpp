@@ -652,7 +652,8 @@ public:
 
   void _onSetFeature(uint8_t reportId, const uint8_t *buffer, uint16_t len) override {
     if (reportId == CONFIG_REPORT_ID) {
-      config_apply_wire(buffer, len);
+      // Deferred: NVS writes are not safe from the TinyUSB task.
+      config_queue_wire(buffer, len);
       return;
     }
     if (reportId == 0x0D) {

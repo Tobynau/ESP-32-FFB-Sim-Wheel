@@ -103,9 +103,14 @@ static void config_sanitize() {
     if (g_cfg.brake_curve > 2) g_cfg.brake_curve = 2;
 }
 
+static bool prefs_started = false;
+
 void config_init() {
     config_defaults();
-    prefs.begin("ffbwheel", false);
+    if (!prefs_started) {
+        prefs.begin("ffbwheel", false);
+        prefs_started = true;
+    }
     if (prefs.getUInt("magic", 0) == CFG_MAGIC &&
         prefs.getBytesLength("cfg") == sizeof(WheelSettings)) {
         prefs.getBytes("cfg", &g_cfg, sizeof(WheelSettings));
@@ -149,6 +154,24 @@ uint16_t config_fill_wire(uint8_t *buf, uint16_t maxlen) {
     w.brake_curve = g_cfg.brake_curve;
     memcpy(buf, &w, sizeof(w));
     return sizeof(w);
+}
+
+static uint8_t pending_wire[CONFIG_WIRE_SIZE];
+static volatile bool pending_ready = false;
+
+void config_queue_wire(const uint8_t *buf, uint16_t len) {
+    if (!buf || len < CONFIG_WIRE_SIZE) return;
+    if (pending_ready) return; // one in flight; host will re-read and retry
+    memcpy(pending_wire, buf, CONFIG_WIRE_SIZE);
+    pending_ready = true;
+}
+
+void config_process_pending() {
+    if (!pending_ready) return;
+    uint8_t local[CONFIG_WIRE_SIZE];
+    memcpy(local, pending_wire, CONFIG_WIRE_SIZE);
+    pending_ready = false;
+    config_apply_wire(local, CONFIG_WIRE_SIZE);
 }
 
 void config_apply_wire(const uint8_t *buf, uint16_t len) {
