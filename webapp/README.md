@@ -1,44 +1,23 @@
-# ESP32 FFB Wheel Web App
+# FFB Wheel Config (web app)
 
-Browser-based tuning app for the ESP32 FFB wheel using Web Serial, hosted on GitHub Pages.
+Browser-based tuning/calibration tool for the wheel. Single static page, no
+build step, no drivers, no installed software — it talks to the wheel with
+**WebHID** over the vendor feature reports described in
+[CONFIG_PROTOCOL.md](../CONFIG_PROTOCOL.md).
 
-## Access
+Hosted by GitHub Pages at `https://tobynau.github.io/ESP-32-FFB-Sim-Wheel/`
+(deployed from `webapp/public/` by `.github/workflows/static.yml`).
 
-Hosted at: `https://<username>.github.io/ESP-32-FFB-Sim-Wheel/`
+## Use
 
-Open in a Chromium-based browser (Chrome, Edge) — Web Serial API is required.
+1. Plug the wheel in and open the page in **Chrome or Edge** (WebHID isn't in
+   Firefox/Safari). Local testing works from `file://` or any local server.
+2. **Connect** → pick "ESP32-S3 FFB Wheel" in the chooser.
+3. Tune while driving — **Apply (RAM)** sends without persisting, **Apply &
+   Save** writes to NVS.
+4. **Calibrate** each pedal: click, move it through full travel (brake: press
+   to your desired 100%), click **Done**, then Apply & Save.
+5. **Set center** with the wheel held straight.
 
-## Why this design
-
-- The game communicates over USB HID (FFB + joystick reports).
-- This app communicates over USB CDC Serial (Web Serial API).
-- HID and CDC are separate interfaces in the composite USB device, so the game and app do not contend for the same endpoint.
-
-## Serial protocol
-
-Commands sent by the web app:
-
-- `get`
-- `recenter`
-- `ping`
-- `set <key> <value>`
-
-Config keys:
-
-- `max_angle_deg`
-- `angle_limit_stiffness`
-- `overall_strength`
-- `motor_max_amps`
-- `device_gain`
-- `scale_constant`
-- `scale_spring`
-- `scale_damper`
-- `scale_inertia`
-- `scale_friction`
-- `scale_periodic`
-
-Firmware emits newline-delimited JSON:
-
-- `{"type":"config", ...}`
-- `{"type":"telemetry", ...}` (20 Hz)
-- `{"type":"ok", ...}` / `{"type":"error", ...}`
+The game and this page can be open at the same time: the game uses the
+joystick/PID HID collection, this page uses the separate vendor collection.

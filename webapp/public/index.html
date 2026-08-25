@@ -1,86 +1,412 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ESP32 FFB Wheel Tuner</title>
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FFB Wheel Config</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --muted: #8b93a3; --accent: #4f8cff; --ok: #3ccf7a;
+    --warn: #f5b942; --bad: #ff5c5c; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+  .pill { font-family: var(--mono); font-size: 12px; padding: 3px 10px; border-radius: 99px;
+          border: 1px solid var(--line); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+           padding: 7px 14px; border-radius: 6px; cursor: pointer; font: inherit; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; display: grid; gap: 20px;
+         grid-template-columns: 1fr 1fr; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+               margin: 0 0 12px; font-weight: 600; }
+  .row { display: grid; grid-template-columns: 1fr 140px 64px; align-items: center; gap: 10px; padding: 5px 0; }
+  .row label { color: var(--fg); }
+  .row small { display: block; color: var(--muted); font-size: 11px; }
+  .row input[type=range] { width: 100%; accent-color: var(--accent); }
+  .row input[type=number] { width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+                            border-radius: 4px; padding: 4px 6px; font-family: var(--mono); font-size: 12px; }
+  .row select { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px;
+                padding: 4px 6px; grid-column: span 2; }
+  .flags { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; }
+  .flags label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .dirty { color: var(--warn); font-family: var(--mono); font-size: 12px; }
+  .tel { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
+  .stat .v { font-family: var(--mono); font-size: 20px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .bar { position: relative; height: 10px; background: var(--bg); border-radius: 5px; overflow: hidden; margin-top: 6px; }
+  .bar > i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); width: 0; }
+  .bar.center > i { left: 50%; }
+  .wheel { display: flex; justify-content: center; margin: 8px 0 12px; }
+  .wheel svg { width: 150px; height: 150px; }
+  .cal { display: grid; grid-template-columns: 90px 1fr auto; gap: 8px 12px; align-items: center; }
+  .cal .raw { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .cal .rng { font-family: var(--mono); font-size: 12px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--panel2); color: var(--muted); }
+  .chip.on { background: #1f3a2a; color: var(--ok); }
+  .chip.warn { background: #3a3120; color: var(--warn); }
+  #log { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: pre-wrap; max-height: 120px; overflow: auto; }
+  .notice { grid-column: 1 / -1; background: #2b2412; border: 1px solid var(--warn); color: var(--warn);
+            padding: 12px 16px; border-radius: 8px; }
+  a { color: var(--accent); }
+</style>
 </head>
 <body>
-  <main class="container">
-    <header class="header">
-      <h1>ESP32 FFB Wheel Tuner</h1>
-      <p class="subtitle">Web Serial tuning and live telemetry (separate USB CDC interface)</p>
-      <div class="toolbar">
-        <button id="connectBtn" class="btn primary">Connect</button>
-        <button id="disconnectBtn" class="btn" disabled>Disconnect</button>
-        <button id="recenterBtn" class="btn accent" disabled>Recenter</button>
-        <span id="status" class="status">Disconnected</span>
-      </div>
-    </header>
+<header>
+  <h1>FFB Wheel Config</h1>
+  <span id="status" class="pill">disconnected</span>
+  <span id="dirty" class="dirty"></span>
+  <span class="spacer"></span>
+  <button id="btnConnect" class="primary">Connect</button>
+  <button id="btnDisconnect" disabled>Disconnect</button>
+</header>
 
-    <section class="grid two-col">
-      <article class="card">
-        <h2>Wheel</h2>
-        <div class="control">
-          <label for="max_angle_deg">Max Angle (deg)</label>
-          <input id="max_angle_deg" type="range" min="180" max="2160" step="10" />
-          <output id="max_angle_deg_out"></output>
-        </div>
-        <div class="control">
-          <label for="angle_limit_stiffness">Angle Limit Stiffness</label>
-          <input id="angle_limit_stiffness" type="range" min="0" max="2000" step="5" />
-          <output id="angle_limit_stiffness_out"></output>
-        </div>
-      </article>
+<main>
+  <div id="unsupported" class="notice" hidden>
+    This page needs <b>WebHID</b>, available in Chrome and Edge (desktop). Firefox and Safari don't support it.
+  </div>
 
-      <article class="card">
-        <h2>Power</h2>
-        <div class="control">
-          <label for="overall_strength">Overall Strength</label>
-          <input id="overall_strength" type="range" min="0" max="2" step="0.01" />
-          <output id="overall_strength_out"></output>
-        </div>
-        <div class="control">
-          <label for="motor_max_amps">Motor Max Amps</label>
-          <input id="motor_max_amps" type="range" min="1" max="80" step="0.5" />
-          <output id="motor_max_amps_out"></output>
-        </div>
-        <div class="control">
-          <label for="device_gain">Device Gain (host FFB gain)</label>
-          <input id="device_gain" type="range" min="0" max="1" step="0.01" />
-          <output id="device_gain_out"></output>
-        </div>
-      </article>
-    </section>
+  <section>
+    <h2>Steering &amp; torque</h2>
+    <div id="grp-steer"></div>
+  </section>
 
-    <section class="card">
-      <h2>FFB Effect Scales</h2>
-      <div class="grid three-col">
-        <div class="control"><label for="scale_constant">Constant</label><input id="scale_constant" type="range" min="0" max="2" step="0.01" /><output id="scale_constant_out"></output></div>
-        <div class="control"><label for="scale_spring">Spring</label><input id="scale_spring" type="range" min="0" max="2" step="0.01" /><output id="scale_spring_out"></output></div>
-        <div class="control"><label for="scale_damper">Damper</label><input id="scale_damper" type="range" min="0" max="2" step="0.01" /><output id="scale_damper_out"></output></div>
-        <div class="control"><label for="scale_inertia">Inertia</label><input id="scale_inertia" type="range" min="0" max="2" step="0.01" /><output id="scale_inertia_out"></output></div>
-        <div class="control"><label for="scale_friction">Friction</label><input id="scale_friction" type="range" min="0" max="2" step="0.01" /><output id="scale_friction_out"></output></div>
-        <div class="control"><label for="scale_periodic">Periodic</label><input id="scale_periodic" type="range" min="0" max="2" step="0.01" /><output id="scale_periodic_out"></output></div>
-      </div>
-    </section>
+  <section>
+    <h2>Live</h2>
+    <div class="wheel">
+      <svg viewBox="-60 -60 120 120">
+        <circle r="54" fill="none" stroke="#2a2f3a" stroke-width="8"/>
+        <g id="rim">
+          <circle r="54" fill="none" stroke="#4f8cff" stroke-width="8" stroke-dasharray="20 320" stroke-dashoffset="10"/>
+          <line x1="0" y1="0" x2="0" y2="-50" stroke="#e6e8ee" stroke-width="3" stroke-linecap="round"/>
+        </g>
+        <text id="angleText" y="6" text-anchor="middle" fill="#e6e8ee" font-family="ui-monospace,monospace" font-size="14">0.0°</text>
+      </svg>
+    </div>
+    <div class="tel">
+      <div class="stat"><div class="k">Velocity</div><div class="v" id="t_vel">–</div></div>
+      <div class="stat"><div class="k">Torque</div><div class="v" id="t_tq">–</div>
+        <div class="bar center"><i id="b_tq"></i></div></div>
+      <div class="stat"><div class="k">Effects</div><div class="v" id="t_fx">–</div></div>
+    </div>
+    <div class="chips" style="margin-top:10px" id="flags"></div>
+  </section>
 
-    <section class="card telemetry">
-      <h2>Live Telemetry</h2>
-      <div class="stats">
-        <div><span>Steering Angle</span><strong id="tel_angle">0.00°</strong></div>
-        <div><span>Velocity</span><strong id="tel_vel">0.00 rad/s</strong></div>
-        <div><span>Button Bits</span><strong id="tel_buttons">0</strong></div>
-        <div><span>Left Paddle</span><strong id="tel_left">0</strong></div>
-        <div><span>Right Paddle</span><strong id="tel_right">0</strong></div>
-        <div><span>Cmd Current</span><strong id="tel_cmd">0.00 A</strong></div>
-        <div><span>Motor Current</span><strong id="tel_motor">0.00 A</strong></div>
-        <div><span>FFB Active</span><strong id="tel_ffb">0</strong></div>
-      </div>
-    </section>
-  </main>
+  <section>
+    <h2>End-stop</h2>
+    <div id="grp-endstop"></div>
+  </section>
 
-  <script src="app.js" defer></script>
+  <section>
+    <h2>Output conditioning</h2>
+    <div id="grp-cond"></div>
+  </section>
+
+  <section>
+    <h2>Base feel (always on, under game FFB)</h2>
+    <div id="grp-base"></div>
+  </section>
+
+  <section>
+    <h2>Behaviour</h2>
+    <div class="flags" id="grp-flags"></div>
+    <div id="grp-flagvals" style="margin-top:8px"></div>
+  </section>
+
+  <section style="grid-column: 1 / -1">
+    <h2>Pedals</h2>
+    <div class="cal">
+      <div>Clutch</div>
+      <div><div class="bar"><i id="b_clutch"></i></div><div class="raw">raw <span id="r_clutch">–</span> · cal <span class="rng" id="c_clutch"></span></div></div>
+      <button data-cal="clutch">Calibrate</button>
+      <div>Throttle</div>
+      <div><div class="bar"><i id="b_gas"></i></div><div class="raw">raw <span id="r_gas">–</span> · cal <span class="rng" id="c_gas"></span></div></div>
+      <button data-cal="gas">Calibrate</button>
+      <div>Brake</div>
+      <div><div class="bar"><i id="b_brake"></i></div><div class="raw">raw <span id="r_brake">–</span> · full scale <span class="rng" id="c_brake"></span></div></div>
+      <button data-cal="brake">Calibrate</button>
+    </div>
+    <p id="calHint" class="raw" style="color:var(--muted);margin:10px 0 0"></p>
+    <div id="grp-pedals" style="margin-top:8px"></div>
+  </section>
+
+  <div class="actions">
+    <button id="btnApply" disabled>Apply (RAM)</button>
+    <button id="btnSave" class="primary" disabled>Apply &amp; Save</button>
+    <button id="btnCenter" disabled>Set center</button>
+    <button id="btnReload" disabled>Reload saved</button>
+    <button id="btnDefaults" class="danger" disabled>Factory defaults</button>
+    <span class="spacer"></span>
+    <button id="btnExport">Export JSON</button>
+    <button id="btnImport">Import JSON</button>
+    <input id="fileImport" type="file" accept="application/json" hidden>
+  </div>
+
+  <section style="grid-column: 1 / -1">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+// ---- Protocol (see CONFIG_PROTOCOL.md) ------------------------------------
+const CFG_ID = 0x60, TEL_ID = 0x61, CFG_LEN = 48, TEL_LEN = 20;
+const CMD = { APPLY: 0, SAVE: 1, CENTER: 2, DEFAULTS: 3, RELOAD: 4 };
+
+// key, offset, type, scale (wire = value*scale), ui metadata
+const FIELDS = [
+  { k:'wheel_range_deg', o:2,  t:'u16', s:1,    g:'steer',   l:'Rotation range',      u:'°',        min:90,  max:1800, step:10 },
+  { k:'max_torque_nm',   o:4,  t:'u16', s:100,  g:'steer',   l:'Max torque',          u:'Nm',       min:0.5, max:25,   step:0.1 },
+  { k:'torque_to_current',o:6, t:'u16', s:100,  g:'steer',   l:'Motor A per Nm',      u:'A/Nm',     min:0.1, max:5,    step:0.01, h:'From motor Kt' },
+  { k:'endstop_k',       o:8,  t:'u16', s:10,   g:'endstop', l:'Spring',              u:'Nm/rad',   min:10,  max:1000, step:5 },
+  { k:'endstop_d',       o:10, t:'u16', s:100,  g:'endstop', l:'Damping',             u:'Nm/(rad/s)',min:0,  max:10,   step:0.05 },
+  { k:'endstop_max_nm',  o:12, t:'u16', s:100,  g:'endstop', l:'Torque cap',          u:'Nm',       min:1,   max:25,   step:0.1 },
+  { k:'recon_cutoff_hz', o:14, t:'u8',  s:1,    g:'cond',    l:'Constant-force LPF',  u:'Hz',       min:0,   max:250,  step:1, h:'0 = off' },
+  { k:'slew_nm_per_ms',  o:15, t:'u16', s:100,  g:'cond',    l:'Slew limit',          u:'Nm/ms',    min:0,   max:50,   step:0.05, h:'0 = off' },
+  { k:'base_damper',     o:17, t:'u16', s:1000, g:'base',    l:'Damper',              u:'Nm/(rad/s)',min:0,  max:2,    step:0.005 },
+  { k:'base_friction_nm',o:19, t:'u16', s:1000, g:'base',    l:'Friction',            u:'Nm',       min:0,   max:2,    step:0.005 },
+  { k:'base_inertia',    o:21, t:'u16', s:1000, g:'base',    l:'Inertia',             u:'Nm/(rad/s²)',min:0, max:1,    step:0.005 },
+  { k:'flags',           o:23, t:'u8',  s:1,    g:null },
+  { k:'breakaway_nm',    o:24, t:'u16', s:1000, g:'flagvals',l:'Breakaway boost',     u:'Nm',       min:0,   max:1,    step:0.005 },
+  { k:'clutch_adc_min',  o:26, t:'u16', s:1,    g:null },
+  { k:'clutch_adc_max',  o:28, t:'u16', s:1,    g:null },
+  { k:'gas_adc_min',     o:30, t:'u16', s:1,    g:null },
+  { k:'gas_adc_max',     o:32, t:'u16', s:1,    g:null },
+  { k:'brake_fullscale_counts', o:34, t:'u32', s:1, g:null },
+  { k:'pedal_filter',    o:38, t:'u8',  s:1,    g:'pedals',  l:'Pedal filter', sel:['Off','Light','Medium','Heavy'] },
+  { k:'brake_curve',     o:39, t:'u8',  s:1,    g:'pedals',  l:'Brake curve',  sel:['Linear','Mild','Progressive'] },
+];
+const FLAGS = [
+  { bit:0, k:'invert_ffb', l:'Invert FFB direction' },
+  { bit:1, k:'soft_clip',  l:'Soft clip at max torque' },
+  { bit:2, k:'osc_guard',  l:'Oscillation guard (hands-off)' },
+  { bit:3, k:'breakaway',  l:'Breakaway boost' },
+];
+const TEL_FLAGS = ['Actuators on', 'Paused', 'USB active', 'FFB watchdog fading'];
+
+const rd = { u8:(v,o)=>v.getUint8(o), u16:(v,o)=>v.getUint16(o,true), u32:(v,o)=>v.getUint32(o,true) };
+const wr = { u8:(v,o,x)=>v.setUint8(o,x), u16:(v,o,x)=>v.setUint16(o,x,true), u32:(v,o,x)=>v.setUint32(o,x,true) };
+
+function decodeConfig(dv, base) {
+  const c = {};
+  for (const f of FIELDS) c[f.k] = rd[f.t](dv, base + f.o) / f.s;
+  return c;
+}
+function encodeConfig(c, command) {
+  const buf = new ArrayBuffer(CFG_LEN), dv = new DataView(buf);
+  dv.setUint8(0, 1); dv.setUint8(1, command);
+  for (const f of FIELDS) wr[f.t](dv, f.o, Math.round(c[f.k] * f.s));
+  return new Uint8Array(buf);
+}
+function decodeTelemetry(dv, b) {
+  return {
+    angle_deg: dv.getInt32(b + 0, true) / 1000 * 180 / Math.PI,
+    vel_rads:  dv.getInt16(b + 4, true) / 100,
+    torque_nm: dv.getInt16(b + 6, true) / 100,
+    clutch:    dv.getUint16(b + 8, true),
+    gas:       dv.getUint16(b + 10, true),
+    brake:     dv.getInt32(b + 12, true),
+    flags:     dv.getUint8(b + 16),
+    blocks:    dv.getUint8(b + 17),
+    playing:   dv.getUint8(b + 18),
+  };
+}
+
+// ---- State -----------------------------------------------------------------
+let device = null, cfg = null, deviceCfg = null, pollTimer = null, cal = null;
+const $ = id => document.getElementById(id);
+const log = m => { const el = $('log'); el.textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + el.textContent; };
+
+// ---- UI build --------------------------------------------------------------
+function buildControls() {
+  for (const f of FIELDS) {
+    if (!f.g) continue;
+    const row = document.createElement('div'); row.className = 'row';
+    const lab = document.createElement('label');
+    lab.innerHTML = `${f.l}${f.sel ? '' : ` <small>${f.u}${f.h ? ' · ' + f.h : ''}</small>`}`;
+    row.appendChild(lab);
+    if (f.sel) {
+      const sel = document.createElement('select'); sel.id = 'f_' + f.k;
+      f.sel.forEach((n, i) => sel.add(new Option(n, i)));
+      sel.oninput = () => setField(f.k, +sel.value);
+      row.appendChild(sel);
+    } else {
+      const rng = Object.assign(document.createElement('input'), { type:'range', id:'r_'+f.k, min:f.min, max:f.max, step:f.step });
+      const num = Object.assign(document.createElement('input'), { type:'number', id:'f_'+f.k, min:f.min, max:f.max, step:f.step });
+      rng.oninput = () => { num.value = rng.value; setField(f.k, +rng.value); };
+      num.oninput = () => { rng.value = num.value; setField(f.k, +num.value); };
+      row.append(rng, num);
+    }
+    $('grp-' + f.g).appendChild(row);
+  }
+  for (const fl of FLAGS) {
+    const lab = document.createElement('label');
+    const cb = Object.assign(document.createElement('input'), { type:'checkbox', id:'fl_'+fl.k });
+    cb.oninput = () => { cfg.flags = (cfg.flags & ~(1 << fl.bit)) | (cb.checked ? 1 << fl.bit : 0); markDirty(); };
+    lab.append(cb, fl.l);
+    $('grp-flags').appendChild(lab);
+  }
+  TEL_FLAGS.forEach((n, i) => { const c = document.createElement('span'); c.className = 'chip'; c.id = 'tf' + i; c.textContent = n; $('flags').appendChild(c); });
+}
+function setField(k, v) { if (!cfg) return; cfg[k] = v; markDirty(); }
+function renderConfig() {
+  for (const f of FIELDS) {
+    if (!f.g) continue;
+    const v = f.sel ? cfg[f.k] : +cfg[f.k].toFixed(3);
+    $('f_' + f.k).value = v;
+    if (!f.sel) $('r_' + f.k).value = v;
+  }
+  for (const fl of FLAGS) $('fl_' + fl.k).checked = !!(cfg.flags & (1 << fl.bit));
+  $('c_clutch').textContent = `${cfg.clutch_adc_min}–${cfg.clutch_adc_max}`;
+  $('c_gas').textContent = `${cfg.gas_adc_min}–${cfg.gas_adc_max}`;
+  $('c_brake').textContent = `${cfg.brake_fullscale_counts}`;
+  markDirty();
+}
+function markDirty() {
+  const dirty = cfg && deviceCfg && JSON.stringify(cfg) !== JSON.stringify(deviceCfg);
+  $('dirty').textContent = dirty ? '● unsaved changes' : '';
+}
+function setConnected(on) {
+  ['btnApply','btnSave','btnCenter','btnReload','btnDefaults'].forEach(id => $(id).disabled = !on);
+  $('btnConnect').disabled = on; $('btnDisconnect').disabled = !on;
+  $('status').textContent = on ? `connected · ${device.productName}` : 'disconnected';
+  $('status').className = 'pill ' + (on ? 'ok' : '');
+}
+
+// ---- Device I/O ------------------------------------------------------------
+async function readConfig() {
+  const dv = await device.receiveFeatureReport(CFG_ID);
+  // Chrome includes the report ID as the first byte.
+  const base = dv.byteLength === CFG_LEN + 1 ? 1 : 0;
+  cfg = decodeConfig(dv, base);
+  deviceCfg = { ...cfg };
+  renderConfig();
+}
+async function sendCommand(command) {
+  await device.sendFeatureReport(CFG_ID, encodeConfig(cfg, command));
+}
+async function pollTelemetry() {
+  if (!device || !device.opened) return;
+  try {
+    const dv = await device.receiveFeatureReport(TEL_ID);
+    renderTelemetry(decodeTelemetry(dv, dv.byteLength === TEL_LEN + 1 ? 1 : 0));
+  } catch (e) { log('telemetry: ' + e.message); }
+}
+function renderTelemetry(t) {
+  $('rim').setAttribute('transform', `rotate(${t.angle_deg})`);
+  $('angleText').textContent = t.angle_deg.toFixed(1) + '°';
+  $('t_vel').textContent = t.vel_rads.toFixed(2) + ' rad/s';
+  $('t_tq').textContent = t.torque_nm.toFixed(2) + ' Nm';
+  const tq = Math.max(-1, Math.min(1, t.torque_nm / (cfg?.max_torque_nm || 1)));
+  const b = $('b_tq'); b.style.width = Math.abs(tq) * 50 + '%'; b.style.left = tq < 0 ? (50 + tq * 50) + '%' : '50%';
+  $('t_fx').textContent = `${t.blocks} blk${t.playing ? ' · #' + t.playing : ''}`;
+  TEL_FLAGS.forEach((_, i) => { const on = t.flags & (1 << i); $('tf' + i).className = 'chip ' + (on ? (i === 1 || i === 3 ? 'warn' : 'on') : ''); });
+
+  const norm = (v, lo, hi) => Math.max(0, Math.min(1, (v - lo) / Math.max(1, hi - lo)));
+  $('r_clutch').textContent = t.clutch; $('r_gas').textContent = t.gas; $('r_brake').textContent = t.brake;
+  if (cfg) {
+    $('b_clutch').style.width = norm(t.clutch, cfg.clutch_adc_min, cfg.clutch_adc_max) * 100 + '%';
+    $('b_gas').style.width = norm(t.gas, cfg.gas_adc_min, cfg.gas_adc_max) * 100 + '%';
+    const gamma = [1, 1.35, 1.8][cfg.brake_curve] || 1;
+    $('b_brake').style.width = Math.pow(norm(t.brake, 0, cfg.brake_fullscale_counts), gamma) * 100 + '%';
+  }
+  if (cal) {
+    const v = t[cal.axis];
+    cal.min = Math.min(cal.min, v); cal.max = Math.max(cal.max, v);
+    $('calHint').textContent = cal.axis === 'brake'
+      ? `Press the brake as hard as you want "100%" to be, then click Done. Peak so far: ${cal.max}`
+      : `Move the ${cal.axis} through its full travel, then click Done. Seen ${cal.min}–${cal.max}`;
+  }
+}
+
+async function connect() {
+  try {
+    const devices = await navigator.hid.requestDevice({ filters: [{ usagePage: 0xFF00, usage: 0x01 }] });
+    if (!devices.length) return;
+    device = devices[0];
+    if (!device.opened) await device.open();
+    await readConfig();
+    setConnected(true);
+    log(`connected to ${device.productName}`);
+    pollTimer = setInterval(pollTelemetry, 50);
+  } catch (e) { log('connect failed: ' + e.message); }
+}
+async function disconnect() {
+  clearInterval(pollTimer); pollTimer = null;
+  if (device?.opened) await device.close().catch(() => {});
+  device = null; cal = null; setConnected(false); log('disconnected');
+}
+async function action(command, label) {
+  try {
+    await sendCommand(command);
+    log(label);
+    if (command !== CMD.CENTER) await readConfig(); // reflect firmware clamping / defaults / reload
+  } catch (e) { log(`${label} failed: ${e.message}`); }
+}
+
+// ---- Wiring ----------------------------------------------------------------
+buildControls();
+if (!navigator.hid) { $('unsupported').hidden = false; $('btnConnect').disabled = true; }
+$('btnConnect').onclick = connect;
+$('btnDisconnect').onclick = disconnect;
+$('btnApply').onclick = () => action(CMD.APPLY, 'applied to RAM');
+$('btnSave').onclick = () => action(CMD.SAVE, 'applied and saved to NVS');
+$('btnCenter').onclick = () => action(CMD.CENTER, 'center set');
+$('btnReload').onclick = () => action(CMD.RELOAD, 'reloaded saved settings');
+$('btnDefaults').onclick = () => confirm('Restore factory defaults in RAM? (Apply & Save afterwards to persist.)') && action(CMD.DEFAULTS, 'factory defaults loaded');
+
+document.querySelectorAll('[data-cal]').forEach(btn => btn.onclick = () => {
+  const axis = btn.dataset.cal;
+  if (cal && cal.axis === axis) {           // Done
+    if (axis === 'brake') cfg.brake_fullscale_counts = Math.max(1000, cal.max);
+    else { cfg[axis + '_adc_min'] = cal.min; cfg[axis + '_adc_max'] = cal.max; }
+    cal = null; btn.textContent = 'Calibrate'; $('calHint').textContent = 'Captured. Apply & Save to keep it.';
+    renderConfig(); return;
+  }
+  if (!device) { log('connect first'); return; }
+  document.querySelectorAll('[data-cal]').forEach(b => b.textContent = 'Calibrate');
+  cal = { axis, min: Infinity, max: -Infinity }; btn.textContent = 'Done';
+});
+
+$('btnExport').onclick = () => {
+  if (!cfg) return log('nothing to export');
+  const out = { ...cfg }; FLAGS.forEach(f => out[f.k] = !!(cfg.flags & (1 << f.bit))); delete out.flags;
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' })),
+    download: 'ffb-wheel-config.json' });
+  a.click(); URL.revokeObjectURL(a.href);
+};
+$('btnImport').onclick = () => $('fileImport').click();
+$('fileImport').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const j = JSON.parse(await f.text());
+    cfg = cfg || {};
+    for (const fd of FIELDS) if (fd.k !== 'flags' && j[fd.k] != null) cfg[fd.k] = +j[fd.k];
+    let flags = cfg.flags || 0;
+    FLAGS.forEach(fl => { if (j[fl.k] != null) flags = (flags & ~(1 << fl.bit)) | (j[fl.k] ? 1 << fl.bit : 0); });
+    cfg.flags = flags; renderConfig(); log(`imported ${f.name} — Apply to send to wheel`);
+  } catch (err) { log('import failed: ' + err.message); }
+  e.target.value = '';
+};
+navigator.hid?.addEventListener('disconnect', ev => { if (ev.device === device) disconnect(); });
+</script>
 </body>
 </html>
