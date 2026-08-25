@@ -74,7 +74,7 @@
   <span id="dirty" class="dirty"></span>
   <span class="spacer"></span>
   <button id="btnConnect" class="primary">Connect</button>
-  <button id="btnDisconnect" disabled>Disconnect</button>
+  <button id="btnDisconnect" disabled>Eject</button>
 </header>
 
 <main>
@@ -351,7 +351,7 @@ async function connect() {
 async function disconnect() {
   clearInterval(pollTimer); pollTimer = null;
   if (device?.opened) await device.close().catch(() => {});
-  device = null; cal = null; setConnected(false); log('disconnected');
+  device = null; cal = null; setConnected(false); log('ejected — wheel is free for games');
 }
 async function action(command, label) {
   try {
@@ -407,6 +407,9 @@ $('fileImport').onchange = async e => {
   e.target.value = '';
 };
 navigator.hid?.addEventListener('disconnect', ev => { if (ev.device === device) disconnect(); });
+// Release the wheel whenever this tab is hidden/closed so a game can open it.
+document.addEventListener('visibilitychange', () => { if (document.hidden && device) disconnect(); });
+window.addEventListener('pagehide', () => { if (device) disconnect(); });
 </script>
 </body>
 </html>

@@ -19,5 +19,7 @@ Hosted by GitHub Pages at `https://tobynau.github.io/ESP-32-FFB-Sim-Wheel/`
    to your desired 100%), click **Done**, then Apply & Save.
 5. **Set center** with the wheel held straight.
 
-The game and this page can be open at the same time: the game uses the
-joystick/PID HID collection, this page uses the separate vendor collection.
+**Eject before gaming.** While this page holds the wheel open, games can't
+acquire it (the browser opens the whole HID device, not just the vendor
+collection). Click **Eject**, or just switch tabs — the page releases the
+wheel automatically when hidden or closed.
